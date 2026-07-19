@@ -43,7 +43,9 @@ Release 附件中已提供安装说明：
 
 - `README-sing-box-with-v2ray-api.md`
 
-## 赞助与推荐
+---
+<details>
+<summary><strong> 原作者的赞助与推荐</strong></summary>
 
 ### VPS / 服务器赞助商
 
@@ -122,3 +124,5 @@ Release 附件中已提供安装说明：
   </a>
   — 服务器实时监控（CPU / 内存 / 磁盘）/ 容器管理（Docker / Podman）/ 端口转发（本地 / 远程 / 动态）/ SFTP 文件管理 / 代理功能（SOCKS / HTTP）/ 分组管理。
 </p>
+
+</details>
