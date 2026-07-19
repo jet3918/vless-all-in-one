@@ -1,27 +1,27 @@
 # vless-all-in-one
 
-[English](./README.md) | [简体中文](./README_CN.md)
+[English](./README_EN.md) | [简体中文](./README.md)
 
-Linux 服务器一体化代理部署脚本。
+An all-in-one proxy deployment script for Linux servers.
 
-它可以帮助你快速部署和管理多种协议，包括 **VLESS**、**VMess**、**Trojan**、**Hysteria2**、**TUIC**、**NaiveProxy**、**Snell**、**SOCKS5** 和 **SS2022**。
+It helps you quickly deploy and manage multiple protocols in one place, including **VLESS**, **VMess**, **Trojan**, **Hysteria2**, **TUIC**, **NaiveProxy**, **Snell**, **SOCKS5**, and **SS2022**.
 
-## 文档
+## Documentation
 
-- **网站文档：** https://docs.vaiox.de/
-- **Telegram 群组：** https://t.me/vless_vaio
-- **Telegram 频道：** https://t.me/vaio_channel
+- **Website:** https://docs.vaiox.de/
+- **Telegram Group:** https://t.me/vless_vaio
+- **Telegram Channel:** https://t.me/vaio_channel
 
-## 赞助与推荐
+## Sponsors & Recommendations
 
-### VPS / 服务器赞助商
+### Hosting Sponsors
 
 <p>
   <a href="https://www.takehost.biz/" target="_blank" rel="noopener noreferrer">
     <img src="https://www.takehost.biz/favicon.ico" alt="takehost" width="50" height="50" style="vertical-align: middle; margin-right: 6px;" />
     <strong>takehost</strong>
   </a>
-  — 提供独立服务器、VPS 和游戏服务器，网络峰值可达 100 Gbps。
+  — Dedicated servers, VPS, and game servers with up to 100 Gbps networking.
 </p>
 
 <p>
@@ -29,7 +29,7 @@ Linux 服务器一体化代理部署脚本。
     <img src="https://akile.io/favicon.ico" alt="AkileCloud" height="50" style="vertical-align: middle; margin-right: 6px;" />
     <strong>AkileCloud</strong>
   </a>
-  — 多地区覆盖 / 解锁流媒体 / 提供多国 SOCKS5 落地出口 / 包含原生家宽 IP / 高性价比。
+  — Multi-region coverage, streaming-unlocked routes, multi-country SOCKS5 exit nodes, native residential IP options, and strong value for money.
 </p>
 
 <p>
@@ -37,7 +37,7 @@ Linux 服务器一体化代理部署脚本。
     <img src="https://cloud.yt.net/logo.png" alt="YT.NET" height="50" style="vertical-align: middle; margin-right: 6px;" />
     <strong>YT.NET</strong>
   </a>
-  — 原生 IP / 送 CNIX NAT 入口 / 深港节点 / BGP 国际网络。
+  — Native IP, complimentary CNIX NAT entry, Shenzhen–Hong Kong optimized routes, and a BGP international network.
 </p>
 
 <p>
@@ -45,7 +45,7 @@ Linux 服务器一体化代理部署脚本。
     <img src="https://dash.lain.sh/img/favicon-16x16.png" alt="Lain.sh" height="50" style="vertical-align: middle; margin-right: 6px;" />
     <strong>Lain.sh</strong>
   </a>
-  — 原生 IP / 解锁流媒体 / 家宽 ISP / 独立服务器。
+  — Native IP, streaming-unlocked routes, residential ISP resources, and dedicated servers.
 </p>
 
 <p>
@@ -53,7 +53,7 @@ Linux 服务器一体化代理部署脚本。
     <img src="https://www.cstonecloud.com/logo.png" alt="CstoneCloud" height="15" style="vertical-align: middle; margin-right: 6px;" />
     <strong>CstoneCloud</strong>
   </a>
-  — 住宅双 ISP / 解锁流媒体 / 直连 & 五网回程 9929 / CN2 双向接入。
+  — Residential dual-ISP connectivity, streaming-unlocked routes, direct connectivity and five-network 9929 return paths, plus dual CN2 access.
 </p>
 
 <p>
@@ -61,7 +61,7 @@ Linux 服务器一体化代理部署脚本。
     <img src="https://www.skylineconnect.io/images/favicon.svg" height="50">
     <strong>SkylineConnect</strong>
   </a>
-  — 软银 / Lumen / 大陆优化 / 大流量服务器 / 虚拟机 10Gbps 网口。
+  — SoftBank/Lumen routes, mainland China optimized networking, high-traffic servers, and 10 Gbps virtual machine ports.
 </p>
 
 <p>
@@ -69,56 +69,56 @@ Linux 服务器一体化代理部署脚本。
     <img src="https://www.geelinx.com/favicon.ico" alt="Geelinx" height="50" style="vertical-align: middle; margin-right: 6px;" />
     <strong>Geelinx</strong>
   </a>
-  — 解锁流媒体 / 大陆优化 / 单向带宽计费。
+  — Streaming-unlocked routes, mainland China optimized networking, and one-way bandwidth billing.
 </p>
 
-### 指纹浏览器推荐
+### Recommended Fingerprint Browser
 
 <p>
   <a href="https://roxybrowser.com?code=0128SUFA" target="_blank" rel="noopener noreferrer">
     <img src="https://roxybrowser.com/favicon.ico" alt="RoxyBrowser" height="50" style="vertical-align: middle; margin-right: 6px;" />
     <strong>RoxyBrowser</strong>
   </a>
-  — 多账号独立环境 / 多端同步 / 防关联检测 / 团队协作 / 浏览器指纹隔离 / 代理绑定 / AI 多账号管理。
+  — Isolated multi-account environments, cross-device sync, anti-linking detection, team collaboration, browser fingerprint isolation, proxy binding, and AI-powered multi-account management.
 </p>
 
-### iOS SSH 客户端推荐
+### Recommended iOS SSH App
 
 <p>
   <a href="https://apps.apple.com/us/app/careserver/id6474921250" target="_blank" rel="noopener noreferrer">
     <img src="https://nicejwin.github.io/CareServerWebSite/assets/img/logo.png" alt="CareServer" height="50" style="vertical-align: middle; margin-right: 6px;" />
     <strong>CareServer</strong>
   </a>
-  — 服务器实时监控（CPU / 内存 / 磁盘）/ 容器管理（Docker / Podman）/ 端口转发（本地 / 远程 / 动态）/ SFTP 文件管理 / 代理功能（SOCKS / HTTP）/ 分组管理。
+  — Real-time server monitoring (CPU, memory, disk), container management (Docker/Podman), port forwarding (local/remote/dynamic), SFTP file management, proxy support (SOCKS/HTTP), and group management.
 </p>
 
-## 功能特性
+## Features
 
-- 一键安装与管理
-- 支持多协议共存部署
-- 适配 Debian、Ubuntu、CentOS 和 Alpine
-- 基于 Xray + Sing-box 双核心架构
-- 提供用户管理、路由、订阅与故障排查文档
+- One-click installation and management
+- Supports multiple protocols on the same server
+- Built for Debian, Ubuntu, CentOS, and Alpine
+- Xray + Sing-box dual-core architecture
+- User management, routing, subscriptions, and troubleshooting docs
 
-## 快速安装
+## Quick Install
 
 ```bash
 wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-## 文档入口
+## Documents
 
-- [网站文档](https://docs.vaiox.de/)
+- [Website Docs](https://docs.vaiox.de/)
 
-## 用于流量统计的自定义 Sing-box 构建
+## Sing-box custom build for traffic stats
 
-从 **v3.5.3** 开始，**Hysteria2 / TUIC / AnyTLS** 的用户流量统计功能需要启用 `with_v2ray_api` 的自定义 Sing-box 构建。
+Starting from **v3.5.3**, Sing-box user traffic statistics for **Hysteria2 / TUIC / AnyTLS** require a custom Sing-box build with `with_v2ray_api` enabled.
 
-默认的上游 Sing-box 二进制通常 **不包含** 此能力。
+The default upstream Sing-box binary usually does **not** include this capability.
 
-如果你需要使用 Sing-box 的流量同步 / 配额 / 到期等功能，请下载对应 GitHub Release 附件中的自定义 Sing-box，并替换当前的 `/usr/local/bin/sing-box`。
+For users who need Sing-box traffic sync / quota / expiry workflows, download the custom Sing-box asset attached to the corresponding GitHub Release and replace your current `/usr/local/bin/sing-box` binary.
 
-Release 附件中已提供安装说明：
+A step-by-step installation note is provided in the release asset:
 
 - `README-sing-box-with-v2ray-api.md`
 
