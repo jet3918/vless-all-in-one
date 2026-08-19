@@ -22,7 +22,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.6.0 [服务端]
+#  多协议代理一键部署脚本 v3.6.1 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -40,7 +40,7 @@ fi
 #  项目地址: https://github.com/jet3918/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.6.0"
+readonly VERSION="3.6.1"
 readonly AUTHOR="jet3918"
 readonly REPO_URL="https://github.com/jet3918/vless-all-in-one"
 readonly SCRIPT_REPO="jet3918/vless-all-in-one"
@@ -63,6 +63,9 @@ readonly DB_LOCK_FILE="$CFG/.database.lock"
 readonly DB_LOCK_DIR="$CFG/.database.lock.d"
 readonly MANIFEST_FILE="$CFG/managed-paths.txt"
 readonly VERSION_CACHE_DIR="$CFG/cache/version"
+readonly CORE_RESTART_SCHEDULE_FILE="$CFG/core-restart-schedule.conf"
+readonly CORE_RESTART_LASTRUN_FILE="$CFG/core-restart-last-run"
+readonly CORE_RESTART_LOG_FILE="$CFG/core-restart.log"
 
 # 创建安全目录并收紧敏感文件权限
 ensure_secure_permissions() {
@@ -2500,6 +2503,17 @@ remove_cron_entry() {
 ' "$current" | grep -v "$tag" | crontab -
 }
 
+ensure_cron_service_running() {
+    if [[ "$DISTRO" == "alpine" ]]; then
+        rc-service cronie start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
+        rc-update add cronie default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl enable cron >/dev/null 2>&1 || systemctl enable crond >/dev/null 2>&1 || true
+        systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1 || true
+    fi
+}
+
+
 # 创建流量统计定时任务
 setup_traffic_cron() {
     local interval="${1:-$(get_traffic_interval)}"
@@ -2513,13 +2527,7 @@ setup_traffic_cron() {
     cron_cmd="$(build_cron_command "*/$interval * * * *" "$script_path" "--sync-traffic" "$log_file") # sync-traffic"
 
     # 确保 cron 服务已启动
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service cronie start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
-        rc-update add cronie default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
-    elif command -v systemctl >/dev/null 2>&1; then
-        systemctl enable cron >/dev/null 2>&1 || systemctl enable crond >/dev/null 2>&1 || true
-        systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1 || true
-    fi
+    ensure_cron_service_running
 
     if install_cron_entry "sync-traffic" "$cron_cmd"; then
         set_traffic_interval "$interval"
@@ -11497,7 +11505,7 @@ core_control() { # core_control start|stop|restart xray|singbox|all
 }
 
 show_core_runtime_status() {
-    local core display service protocols manager
+    local core display service protocols manager status_icon status_text proto proto_first=true
     manager=$([[ "$DISTRO" == "alpine" ]] && echo "OpenRC" || echo "systemd")
     _line
     echo -e "  ${C}核心运行状态${NC}  ${D}[$DISTRO / $manager]${NC}"
@@ -11507,17 +11515,36 @@ show_core_runtime_status() {
         display=$(_core_display_name "$core")
         service=$(_core_service_name "$core")
         protocols=$(_core_protocols "$core" 2>/dev/null)
+
         if [[ -z "$protocols" ]]; then
-            echo -e "  ${D}○${NC} ${display} - ${D}未配置${NC}"
+            status_icon="${D}○${NC}"
+            status_text="${D}未配置${NC}"
         elif svc status "$service" >/dev/null 2>&1; then
-            echo -e "  ${G}●${NC} ${display} - ${G}运行中${NC} ${D}(${service})${NC}"
+            status_icon="${G}●${NC}"
+            status_text="${G}运行中${NC}"
         else
-            echo -e "  ${R}●${NC} ${display} - ${R}已停止${NC} ${D}(${service})${NC}"
+            status_icon="${R}●${NC}"
+            status_text="${R}已停止${NC}"
         fi
+
+        printf '  %b %-10s %-12b %b
+' "$status_icon" "$display" "$status_text" "${D}(${service})${NC}"
+
         if [[ -n "$protocols" ]]; then
-            echo -e "      ${D}协议: $(echo "$protocols" | tr '\\n' ' ')${NC}"
+            proto_first=true
+            for proto in $protocols; do
+                if [[ "$proto_first" == "true" ]]; then
+                    printf '      协议: %s
+' "$proto"
+                    proto_first=false
+                else
+                    printf '            %s
+' "$proto"
+                fi
+            done
         fi
     done
+    show_core_restart_schedule_status
     _line
 }
 
@@ -11550,6 +11577,189 @@ _manage_core_action() {
     _pause
 }
 
+
+_core_schedule_format_hours() {
+    local hours="$1"
+    [[ -z "$hours" ]] && { echo "未启用"; return; }
+    local out=() hour
+    IFS=',' read -r -a _hrs <<< "$hours"
+    for hour in "${_hrs[@]}"; do
+        [[ -z "$hour" ]] && continue
+        printf -v hour_fmt '%02d:00' "$hour"
+        out+=("$hour_fmt")
+    done
+    local joined="${out[*]}"
+    joined=${joined// /、}
+    echo "每天 ${joined}（上海时间）"
+}
+
+_core_schedule_load_hours() {
+    [[ -f "$CORE_RESTART_SCHEDULE_FILE" ]] || return 1
+    local hours=""
+    while IFS='=' read -r k v; do
+        case "$k" in
+            hours) hours="$v" ;;
+        esac
+    done < "$CORE_RESTART_SCHEDULE_FILE"
+    [[ -n "$hours" ]] || return 1
+    echo "$hours"
+}
+
+_core_schedule_validate_hours() {
+    local input="$1"
+    [[ -n "$input" ]] || return 1
+    local cleaned
+    cleaned=$(echo "$input" | tr '，；;|' ',' | tr -d ' ')
+    [[ -n "$cleaned" ]] || return 1
+    local part
+    IFS=',' read -r -a _parts <<< "$cleaned"
+    local valid=() seen=""
+    for part in "${_parts[@]}"; do
+        [[ "$part" =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || return 1
+        case ",$seen," in
+            *",$part,"*) ;;
+            *) valid+=("$part"); seen+="${seen:+,}$part" ;;
+        esac
+    done
+    ((${#valid[@]} > 0)) || return 1
+    printf '%s\n' "${valid[@]}" | sort -n | paste -sd, -
+}
+
+setup_core_restart_cron() {
+    local hours="$1"
+    local normalized script_path log_file cron_cmd bash_path
+    normalized=$(_core_schedule_validate_hours "$hours") || { _err "定时重启小时格式无效"; return 1; }
+    script_path="/usr/local/bin/vless-server.sh"
+    [[ -x "$script_path" ]] || script_path=$(readlink -f "$0")
+    bash_path=$(get_bash_interpreter)
+    [[ -x "$script_path" ]] || { _err "脚本不存在或不可执行: $script_path"; return 1; }
+    [[ -n "$bash_path" ]] || { _err "未找到 bash，无法写入定时任务"; return 1; }
+    log_file="$CORE_RESTART_LOG_FILE"
+    touch "$log_file" 2>/dev/null || true
+    cron_cmd="* * * * * $bash_path $script_path --cron-core-restart-check >> $log_file 2>&1 # core-restart"
+
+    ensure_cron_service_running
+    if install_cron_entry "core-restart" "$cron_cmd"; then
+        cat > "$CORE_RESTART_SCHEDULE_FILE" << EOF
+hours=$normalized
+EOF
+        chmod 600 "$CORE_RESTART_SCHEDULE_FILE" 2>/dev/null || true
+        rm -f "$CORE_RESTART_LASTRUN_FILE" 2>/dev/null || true
+        _ok "已启用核心定时重启：$(_core_schedule_format_hours "$normalized")"
+        echo -e "  ${D}执行对象: 全部已配置核心（Xray / Sing-box）${NC}"
+        echo -e "  ${D}日志: $log_file${NC}"
+        return 0
+    fi
+    _err "核心定时重启任务写入失败"
+    return 1
+}
+
+remove_core_restart_cron() {
+    remove_cron_entry "core-restart"
+    rm -f "$CORE_RESTART_SCHEDULE_FILE" "$CORE_RESTART_LASTRUN_FILE" 2>/dev/null || true
+    _ok "已关闭核心定时重启"
+}
+
+show_core_restart_schedule_status() {
+    local hours label
+    hours=$(_core_schedule_load_hours 2>/dev/null || true)
+    if [[ -n "$hours" ]] && crontab -l 2>/dev/null | grep -q "core-restart"; then
+        label=$(_core_schedule_format_hours "$hours")
+        echo -e "  定时重启: ${G}● 已启用${NC} ${D}($label)${NC}"
+    else
+        echo -e "  定时重启: ${R}○ 未启用${NC} ${D}(上海时间)${NC}"
+    fi
+}
+
+run_core_restart_schedule_check() {
+    init_db
+    local hours stamp current_hm current_hour current_datehour
+    hours=$(_core_schedule_load_hours 2>/dev/null || true)
+    [[ -n "$hours" ]] || exit 0
+
+    current_hm=$(TZ=Asia/Shanghai date '+%H:%M' 2>/dev/null)
+    [[ "$current_hm" == "00:00" || "$current_hm" == "12:00" || "$current_hm" == *':00' ]] || exit 0
+    [[ "${current_hm#*:}" == "00" ]] || exit 0
+    current_hour=$(TZ=Asia/Shanghai date '+%H' 2>/dev/null)
+    current_hour=$((10#$current_hour))
+    case ",$hours," in
+        *",$current_hour,"*) ;;
+        *) exit 0 ;;
+    esac
+
+    current_datehour=$(TZ=Asia/Shanghai date '+%Y-%m-%d-%H' 2>/dev/null)
+    if [[ -f "$CORE_RESTART_LASTRUN_FILE" ]]; then
+        stamp=$(cat "$CORE_RESTART_LASTRUN_FILE" 2>/dev/null)
+        [[ "$stamp" == "$current_datehour" ]] && exit 0
+    fi
+
+    echo "[$(TZ=Asia/Shanghai date '+%F %T %Z')] 触发核心定时重启：$(_core_schedule_format_hours "$hours")"
+    if is_paused; then
+        echo "[$(TZ=Asia/Shanghai date '+%F %T %Z')] 检测到全局暂停标记，跳过本次定时重启"
+        echo "$current_datehour" > "$CORE_RESTART_LASTRUN_FILE"
+        exit 0
+    fi
+
+    if core_control restart all; then
+        echo "$current_datehour" > "$CORE_RESTART_LASTRUN_FILE"
+        echo "[$(TZ=Asia/Shanghai date '+%F %T %Z')] 核心定时重启完成"
+        exit 0
+    fi
+    echo "[$(TZ=Asia/Shanghai date '+%F %T %Z')] 核心定时重启失败"
+    exit 1
+}
+
+manage_core_restart_schedule() {
+    while true; do
+        _header
+        echo -e "  ${W}核心定时重启${NC}"
+        _line
+        show_core_restart_schedule_status
+        echo -e "  ${D}说明: 这里的时间统一按上海时间（Asia/Shanghai）执行${NC}"
+        _line
+        _item "1" "每天 0 点、12 点重启"
+        _item "2" "每天 0 点重启"
+        _item "3" "每天固定几点重启（手动输入）"
+        _item "4" "关闭定时重启"
+        _item "0" "返回"
+        _line
+
+        local choice custom_hour normalized
+        read -rp "  请选择: " choice
+        case "$choice" in
+            1)
+                setup_core_restart_cron "0,12"
+                _pause
+                ;;
+            2)
+                setup_core_restart_cron "0"
+                _pause
+                ;;
+            3)
+                read -rp "  请输入每天固定重启时间（0-23，例如 3 或 03）: " custom_hour
+                normalized=$(_core_schedule_validate_hours "$custom_hour") || {
+                    _err "输入无效，请输入 0-23 之间的整数"
+                    _pause
+                    continue
+                }
+                setup_core_restart_cron "$normalized"
+                _pause
+                ;;
+            4)
+                remove_core_restart_cron
+                _pause
+                ;;
+            0|"")
+                return
+                ;;
+            *)
+                _err "无效选择"
+                _pause
+                ;;
+        esac
+    done
+}
+
 manage_core_services() {
     while true; do
         _header
@@ -11559,7 +11769,8 @@ manage_core_services() {
         _item "2" "核心停止"
         _item "3" "核心开启"
         _item "4" "刷新核心状态"
-        _item "5" "全部协议服务管理"
+        _item "5" "定时重启设置（上海时间）"
+        _item "6" "全部协议服务管理"
         _item "0" "返回"
         _line
 
@@ -11570,7 +11781,8 @@ manage_core_services() {
             2) _manage_core_action "stop" ;;
             3) _manage_core_action "start" ;;
             4) ;;
-            5) manage_all_protocol_services ;;
+            5) manage_core_restart_schedule ;;
+            6) manage_all_protocol_services ;;
             0|"") return ;;
             *) _err "无效选择"; _pause ;;
         esac
@@ -27267,6 +27479,19 @@ case "${1:-}" in
         show_core_runtime_status
         exit 0
         ;;
+    --core-restart-schedule)
+        init_db
+        setup_core_restart_cron "${2:-0,12}"
+        exit $?
+        ;;
+    --core-restart-schedule-off)
+        init_db
+        remove_core_restart_cron
+        exit 0
+        ;;
+    --cron-core-restart-check)
+        run_core_restart_schedule_check
+        ;;
     --setup-expire-cron)
         # 安装过期检查定时任务
         init_db
@@ -27284,6 +27509,8 @@ case "${1:-}" in
         echo "  --core-stop [目标]   停止核心，目标: xray|singbox|all (默认 all)"
         echo "  --core-restart [目标] 重启核心，目标: xray|singbox|all (默认 all)"
         echo "  --core-status        查看 Xray/Sing-box 核心状态"
+        echo "  --core-restart-schedule [小时列表]  设置核心定时重启，如 0,12 或 3"
+        echo "  --core-restart-schedule-off        关闭核心定时重启"
         echo "  --setup-expire-cron  安装过期检查定时任务"
         echo "  --self-check         检查脚本、依赖、权限和数据库"
         echo "  --help, -h           显示帮助信息"
