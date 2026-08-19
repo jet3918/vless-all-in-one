@@ -1,6 +1,28 @@
-#!/bin/bash 
+#!/bin/sh
+# POSIX 启动引导：Alpine 默认可能没有 bash。
+# 先用 /bin/sh 启动，仅在进入 Bash 专用语法前完成检测/安装并重新执行。
+if [ -z "${BASH_VERSION:-}" ]; then
+    if ! command -v bash >/dev/null 2>&1; then
+        if [ -f /etc/alpine-release ] && command -v apk >/dev/null 2>&1; then
+            if [ "$(id -u)" -ne 0 ]; then
+                echo "首次在 Alpine 运行需要 root 权限安装 bash：apk add --no-cache bash" >&2
+                exit 1
+            fi
+            echo "检测到 Alpine 且未安装 bash，正在安装 bash..."
+            apk add --no-cache bash || {
+                echo "bash 安装失败，请先执行：apk add --no-cache bash" >&2
+                exit 1
+            }
+        else
+            echo "未检测到 bash。Debian/Ubuntu 请先安装 bash；Alpine 请执行：apk add --no-cache bash" >&2
+            exit 1
+        fi
+    fi
+    exec bash "$0" "$@"
+fi
+
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.5 [服务端]
+#  多协议代理一键部署脚本 v3.6.0 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -10,7 +32,7 @@
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
 #           Snell v4 / Snell v5 / AnyTLS / TUIC / NaïveProxy (多协议)
 #  插件支持: Snell v4/v5 和 SS2022 可选启用 ShadowTLS
-#  适配: Alpine/Debian/Ubuntu/CentOS
+#  适配: Debian / Ubuntu / Alpine（systemd + OpenRC）
 #  
 #  
 #  作者: Zyx0rx
@@ -18,7 +40,7 @@
 #  项目地址: https://github.com/jet3918/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.5"
+readonly VERSION="3.6.0"
 readonly AUTHOR="jet3918"
 readonly REPO_URL="https://github.com/jet3918/vless-all-in-one"
 readonly SCRIPT_REPO="jet3918/vless-all-in-one"
@@ -53,14 +75,20 @@ ensure_secure_permissions() {
 }
 
 # 简单单实例锁：避免菜单、cron 和重复执行同时改写数据库/配置
+# Alpine BusyBox flock 不支持 -w，因此统一使用 flock -n + 最多 30 秒轮询。
 acquire_instance_lock() {
     install -d -m 700 "$CFG" 2>/dev/null || return 1
     if command -v flock >/dev/null 2>&1; then
         exec 198>"$DB_LOCK_FILE" || return 1
-        if ! flock -w 30 198; then
-            echo "已有另一个 vless-server.sh 实例正在运行，请稍后再试。" >&2
-            return 1
-        fi
+        local waited=0
+        while ! flock -n 198 2>/dev/null; do
+            if [[ $waited -ge 30 ]]; then
+                echo "已有另一个 vless-server.sh 实例正在运行，请稍后再试。" >&2
+                return 1
+            fi
+            sleep 1
+            ((waited++))
+        done
     else
         if ! mkdir "$DB_LOCK_DIR" 2>/dev/null; then
             echo "已有另一个 vless-server.sh 实例正在运行，请稍后再试。" >&2
@@ -3052,7 +3080,7 @@ PROTO_SVC[snell]="vless-snell";     PROTO_EXEC[snell]="/usr/local/bin/snell-serv
 PROTO_SVC[snell-v5]="vless-snell-v5"; PROTO_EXEC[snell-v5]="/usr/local/bin/snell-server-v5 -c $CFG/snell-v5.conf"; PROTO_BIN[snell-v5]="snell-server-v5"; PROTO_KIND[snell-v5]="snell"
 
 # 动态命令：运行时从数据库取参数
-PROTO_SVC[anytls]="vless-anytls"; PROTO_KIND[anytls]="anytls"
+# AnyTLS 已由 Sing-box 统一管理，禁止在这里再次覆盖 PROTO_SVC/PROTO_KIND。
 PROTO_SVC[naive]="vless-naive"; PROTO_KIND[naive]="naive"
 
 # ShadowTLS：主服务 shadow-tls + 额外 backend 服务
@@ -3080,7 +3108,6 @@ declare -A SVC_PROC=(
     [vless-singbox]="sing-box"
     [vless-snell]="snell-server"
     [vless-snell-v5]="snell-server-v5"
-    [vless-anytls]="anytls-server"
     [vless-naive]="caddy"
     [vless-snell-shadowtls]="shadow-tls"
     [vless-snell-v5-shadowtls]="shadow-tls"
@@ -10044,7 +10071,7 @@ create_singbox_service() {
 name="Sing-box Proxy Server"
 command="/usr/local/bin/sing-box"
 command_args="run -c $CFG/singbox.json"
-command_env="ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true"
+export ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS="true"
 command_background="yes"
 pidfile="/run/${service_name}.pid"
 depend() { need net; }
@@ -11151,39 +11178,403 @@ EOF
 
 
 svc() { # svc action service_name
-    local action="$1" name="$2" err
+    local action="$1" name="$2" err state
     err=$(mktemp "${TMPDIR:-/tmp}/vless-service.XXXXXX") || return 1
-    _svc_try() { : >"$err"; "$@" 2>"$err" || { [[ -s "$err" ]] && { _err "服务${action}失败:"; cat "$err"; }; rm -f -- "$err"; return 1; }; rm -f -- "$err"; }
 
-    if [[ "$DISTRO" == "alpine" ]]; then
-        case "$action" in
-            start|restart) _svc_try rc-service "$name" "$action" ;;
-            stop)    rc-service "$name" stop &>/dev/null ;;
-            enable)  rc-update add "$name" default &>/dev/null ;;
-            disable) rc-update del "$name" default &>/dev/null ;;
-            reload)  rc-service "$name" reload &>/dev/null || rc-service "$name" restart &>/dev/null ;;
-            status)
-                rc-service "$name" status &>/dev/null && return 0
-                local pidfile="/run/${name}.pid"
-                [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null && return 0
-                local p="${SVC_PROC[$name]:-}"
-                [[ -n "$p" ]] && _pgrep "$p" && return 0
+    _svc_try() {
+        : >"$err"
+        "$@" 2>"$err" && { rm -f -- "$err"; return 0; }
+        [[ -s "$err" ]] && { _err "服务${action}失败:"; cat "$err"; }
+        rm -f -- "$err"
+        return 1
+    }
+
+    case "$DISTRO" in
+        alpine)
+            command -v rc-service >/dev/null 2>&1 || {
+                _err "Alpine 缺少 rc-service/openrc，请执行: apk add --no-cache openrc"
+                rm -f -- "$err"
                 return 1
-                ;;
-        esac
-    else
-        case "$action" in
-            start|restart)
-                _svc_try systemctl "$action" "$name" || { _err "详细状态信息:"; systemctl status "$name" --no-pager -l || true; return 1; }
-                ;;
-            stop|enable|disable) systemctl "$action" "$name" &>/dev/null ;;
-            reload) systemctl reload "$name" &>/dev/null || systemctl restart "$name" &>/dev/null ;;
-            status)
-                local state; state=$(systemctl is-active "$name" 2>/dev/null)
-                [[ "$state" == active || "$state" == activating ]]
-                ;;
-        esac
+            }
+            case "$action" in
+                start)
+                    svc status "$name" >/dev/null 2>&1 && { rm -f -- "$err"; return 0; }
+                    _svc_try rc-service "$name" start
+                    ;;
+                restart)
+                    if svc status "$name" >/dev/null 2>&1; then
+                        _svc_try rc-service "$name" restart
+                    else
+                        _svc_try rc-service "$name" start
+                    fi
+                    ;;
+                stop)
+                    if ! svc status "$name" >/dev/null 2>&1; then
+                        rm -f -- "$err"
+                        return 0
+                    fi
+                    _svc_try rc-service "$name" stop
+                    ;;
+                enable)
+                    command -v rc-update >/dev/null 2>&1 || { rm -f -- "$err"; return 1; }
+                    rc-update add "$name" default >/dev/null 2>&1 || true
+                    rm -f -- "$err"
+                    return 0
+                    ;;
+                disable)
+                    command -v rc-update >/dev/null 2>&1 || { rm -f -- "$err"; return 1; }
+                    rc-update del "$name" default >/dev/null 2>&1 || true
+                    rm -f -- "$err"
+                    return 0
+                    ;;
+                reload)
+                    if rc-service "$name" reload >/dev/null 2>&1; then
+                        rm -f -- "$err"
+                        return 0
+                    fi
+                    _svc_try rc-service "$name" restart
+                    ;;
+                status)
+                    rm -f -- "$err"
+                    rc-service "$name" status >/dev/null 2>&1 && return 0
+                    local pidfile="/run/${name}.pid"
+                    if [[ -f "$pidfile" ]]; then
+                        local pid
+                        pid=$(cat "$pidfile" 2>/dev/null)
+                        [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 0
+                    fi
+                    return 1
+                    ;;
+                *)
+                    rm -f -- "$err"
+                    _err "未知服务动作: $action"
+                    return 1
+                    ;;
+            esac
+            ;;
+        debian|ubuntu|centos|*)
+            command -v systemctl >/dev/null 2>&1 || {
+                _err "当前系统缺少 systemctl，Debian/Ubuntu 需要 systemd 服务管理器"
+                rm -f -- "$err"
+                return 1
+            }
+            case "$action" in
+                start)
+                    state=$(systemctl is-active "$name" 2>/dev/null || true)
+                    [[ "$state" == "active" || "$state" == "activating" ]] && { rm -f -- "$err"; return 0; }
+                    _svc_try systemctl start "$name"
+                    ;;
+                restart)
+                    _svc_try systemctl restart "$name"
+                    ;;
+                stop)
+                    state=$(systemctl is-active "$name" 2>/dev/null || true)
+                    [[ "$state" == "inactive" || "$state" == "failed" || "$state" == "unknown" || -z "$state" ]] && {
+                        rm -f -- "$err"
+                        return 0
+                    }
+                    _svc_try systemctl stop "$name"
+                    ;;
+                enable)
+                    systemctl enable "$name" >/dev/null 2>&1 || true
+                    rm -f -- "$err"
+                    return 0
+                    ;;
+                disable)
+                    systemctl disable "$name" >/dev/null 2>&1 || true
+                    rm -f -- "$err"
+                    return 0
+                    ;;
+                reload)
+                    if systemctl reload "$name" >/dev/null 2>&1; then
+                        rm -f -- "$err"
+                        return 0
+                    fi
+                    _svc_try systemctl restart "$name"
+                    ;;
+                status)
+                    rm -f -- "$err"
+                    state=$(systemctl is-active "$name" 2>/dev/null || true)
+                    [[ "$state" == "active" || "$state" == "activating" ]]
+                    ;;
+                *)
+                    rm -f -- "$err"
+                    _err "未知服务动作: $action"
+                    return 1
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# 核心运行管理（Debian/Ubuntu: systemd；Alpine: OpenRC）
+# 仅管理共享核心：Xray / Sing-box。Snell、ShadowTLS、NaïveProxy 仍属于独立服务。
+#═══════════════════════════════════════════════════════════════════════════════
+
+_core_normalize() {
+    case "${1,,}" in
+        xray) echo "xray" ;;
+        singbox|sing-box|sing_box) echo "singbox" ;;
+        all|全部|"") echo "all" ;;
+        *) return 1 ;;
+    esac
+}
+
+_core_display_name() {
+    case "$1" in
+        xray) echo "Xray" ;;
+        singbox) echo "Sing-box" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+_core_service_name() {
+    case "$1" in
+        xray) echo "vless-reality" ;;
+        singbox) echo "vless-singbox" ;;
+        *) return 1 ;;
+    esac
+}
+
+_core_protocols() {
+    case "$1" in
+        xray) get_xray_protocols ;;
+        singbox) get_singbox_protocols ;;
+        *) return 1 ;;
+    esac
+}
+
+_core_has_configured_protocols() {
+    local core="$1"
+    [[ -n "$(_core_protocols "$core" 2>/dev/null)" ]]
+}
+
+_core_prepare() {
+    local core="$1" protocols first_proto
+    protocols=$(_core_protocols "$core" 2>/dev/null)
+    [[ -n "$protocols" ]] || {
+        _err "$(_core_display_name "$core") 没有已配置协议，无法启动核心"
+        return 1
+    }
+
+    case "$core" in
+        xray)
+            check_cmd xray || { _err "未检测到 Xray 核心"; return 1; }
+            _info "生成并检查 Xray 配置..."
+            generate_xray_config || { _err "Xray 配置生成失败"; return 1; }
+            if ! xray run -test -c "$CFG/config.json" >/dev/null 2>&1; then
+                _err "Xray 配置检查失败，已取消启动/重启"
+                xray run -test -c "$CFG/config.json" 2>&1 | tail -n 20
+                return 1
+            fi
+            first_proto=$(printf '%s\n' "$protocols" | awk 'NF{print $1; exit}')
+            [[ -n "$first_proto" ]] || return 1
+            create_service "$first_proto" || { _err "Xray 服务文件创建失败"; return 1; }
+            ;;
+        singbox)
+            check_cmd sing-box || { _err "未检测到 Sing-box 核心"; return 1; }
+            _info "生成并检查 Sing-box 配置..."
+            generate_singbox_config || { _err "Sing-box 配置生成失败"; return 1; }
+            if ! sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
+                _err "Sing-box 配置检查失败，已取消启动/重启"
+                sing-box check -c "$CFG/singbox.json" 2>&1 | tail -n 20
+                return 1
+            fi
+            create_server_scripts
+            create_singbox_service || { _err "Sing-box 服务文件创建失败"; return 1; }
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_core_control_one() {
+    local action="$1" core="$2"
+    local display service verb
+    display=$(_core_display_name "$core")
+    service=$(_core_service_name "$core") || return 1
+
+    if ! _core_has_configured_protocols "$core"; then
+        _warn "$display 未配置协议，跳过"
+        return 2
     fi
+
+    case "$action" in
+        start)
+            verb="启动"
+            if svc status "$service" >/dev/null 2>&1; then
+                _ok "$display 核心已经在运行"
+                return 0
+            fi
+            _core_prepare "$core" || return 1
+            svc enable "$service" >/dev/null 2>&1 || true
+            _info "启动 $display 核心..."
+            svc start "$service" || return 1
+            ;;
+        stop)
+            verb="停止"
+            if ! svc status "$service" >/dev/null 2>&1; then
+                _ok "$display 核心已经停止"
+                return 0
+            fi
+            _info "停止 $display 核心..."
+            svc stop "$service" || return 1
+            ;;
+        restart)
+            verb="重启"
+            _core_prepare "$core" || return 1
+            svc enable "$service" >/dev/null 2>&1 || true
+            _info "重启 $display 核心..."
+            if svc status "$service" >/dev/null 2>&1; then
+                svc restart "$service" || return 1
+            else
+                _warn "$display 当前未运行，将执行启动"
+                svc start "$service" || return 1
+            fi
+            ;;
+        *)
+            _err "未知核心操作: $action"
+            return 1
+            ;;
+    esac
+
+    sleep 1
+    case "$action" in
+        stop)
+            if svc status "$service" >/dev/null 2>&1; then
+                _err "$display 核心停止失败：服务仍在运行"
+                return 1
+            fi
+            _ok "$display 核心已停止"
+            ;;
+        start|restart)
+            if svc status "$service" >/dev/null 2>&1; then
+                _ok "$display 核心已${verb}"
+            else
+                _err "$display 核心${verb}失败：服务未进入运行状态"
+                if [[ "$DISTRO" == "alpine" ]]; then
+                    rc-service "$service" status 2>&1 || true
+                else
+                    systemctl status "$service" --no-pager -l 2>&1 | tail -n 30 || true
+                fi
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+core_control() { # core_control start|stop|restart xray|singbox|all
+    local action="$1" target="${2:-all}" core normalized
+    case "$action" in start|stop|restart) ;; *) _err "未知核心操作: $action"; return 1 ;; esac
+    normalized=$(_core_normalize "$target") || {
+        _err "未知核心: $target（可用: xray / singbox / all）"
+        return 1
+    }
+
+    local failed=0 handled=0 rc
+    if [[ "$normalized" == "all" ]]; then
+        for core in xray singbox; do
+            _core_has_configured_protocols "$core" || continue
+            handled=$((handled + 1))
+            _core_control_one "$action" "$core"
+            rc=$?
+            [[ $rc -eq 1 ]] && failed=$((failed + 1))
+        done
+        if [[ $handled -eq 0 ]]; then
+            _warn "没有可管理的 Xray/Sing-box 核心"
+            return 1
+        fi
+    else
+        _core_control_one "$action" "$normalized"
+        rc=$?
+        [[ $rc -eq 2 ]] && return 1
+        [[ $rc -ne 0 ]] && failed=1
+    fi
+    [[ $failed -eq 0 ]]
+}
+
+show_core_runtime_status() {
+    local core display service protocols manager
+    manager=$([[ "$DISTRO" == "alpine" ]] && echo "OpenRC" || echo "systemd")
+    _line
+    echo -e "  ${C}核心运行状态${NC}  ${D}[$DISTRO / $manager]${NC}"
+    _line
+
+    for core in xray singbox; do
+        display=$(_core_display_name "$core")
+        service=$(_core_service_name "$core")
+        protocols=$(_core_protocols "$core" 2>/dev/null)
+        if [[ -z "$protocols" ]]; then
+            echo -e "  ${D}○${NC} ${display} - ${D}未配置${NC}"
+        elif svc status "$service" >/dev/null 2>&1; then
+            echo -e "  ${G}●${NC} ${display} - ${G}运行中${NC} ${D}(${service})${NC}"
+        else
+            echo -e "  ${R}●${NC} ${display} - ${R}已停止${NC} ${D}(${service})${NC}"
+        fi
+        if [[ -n "$protocols" ]]; then
+            echo -e "      ${D}协议: $(echo "$protocols" | tr '\\n' ' ')${NC}"
+        fi
+    done
+    _line
+}
+
+_select_core_target() {
+    SELECTED_CORE_TARGET=""
+    _line
+    echo -e "  ${C}选择核心${NC}"
+    _item "1" "Xray"
+    _item "2" "Sing-box"
+    _item "3" "全部已配置核心"
+    _item "0" "返回"
+    _line
+    local choice
+    read -rp "  请选择: " choice
+    case "$choice" in
+        1) SELECTED_CORE_TARGET="xray" ;;
+        2) SELECTED_CORE_TARGET="singbox" ;;
+        3) SELECTED_CORE_TARGET="all" ;;
+        0|"") return 1 ;;
+        *) _err "无效选择"; return 1 ;;
+    esac
+    return 0
+}
+
+_manage_core_action() {
+    local action="$1"
+    _select_core_target || return 0
+    echo ""
+    core_control "$action" "$SELECTED_CORE_TARGET" || true
+    _pause
+}
+
+manage_core_services() {
+    while true; do
+        _header
+        echo -e "  ${W}核心运行管理${NC}"
+        show_core_runtime_status
+        _item "1" "核心重启"
+        _item "2" "核心停止"
+        _item "3" "核心开启"
+        _item "4" "刷新核心状态"
+        _item "5" "全部协议服务管理"
+        _item "0" "返回"
+        _line
+
+        local choice
+        read -rp "  请选择: " choice
+        case "$choice" in
+            1) _manage_core_action "restart" ;;
+            2) _manage_core_action "stop" ;;
+            3) _manage_core_action "start" ;;
+            4) ;;
+            5) manage_all_protocol_services ;;
+            0|"") return ;;
+            *) _err "无效选择"; _pause ;;
+        esac
+    done
 }
 
 # 通用服务启动/重启辅助函数
@@ -18244,13 +18635,13 @@ show_single_protocol_info() {
 }
 
 # 管理协议服务
-manage_protocol_services() {
+manage_all_protocol_services() {
     local installed=$(get_installed_protocols)
     [[ -z "$installed" ]] && { _warn "未安装任何协议"; return; }
     
     while true; do
         _header
-        echo -e "  ${W}协议服务管理${NC}"
+        echo -e "  ${W}全部协议服务管理${NC}"
         _line
         show_protocols_overview  # 使用简洁概览
         
@@ -26675,7 +27066,7 @@ main_menu() {
             echo -e "  ${D}───────────────────────────────────────────${NC}"
             _item "5" "查看协议配置"
             _item "6" "订阅服务管理"
-            _item "7" "管理协议服务"
+            _item "7" "核心运行管理"
             _item "8" "分流管理"
             _item "9" "CF Tunnel(Argo)"
             _item "10" "端口转发"
@@ -26708,7 +27099,7 @@ main_menu() {
                 4) manage_users; skip_pause=true ;;
                 5) show_all_protocols_info; skip_pause=true ;;
                 6) manage_subscription; skip_pause=true ;;
-                7) manage_protocol_services; skip_pause=true ;;
+                7) manage_core_services; skip_pause=true ;;
                 8) manage_routing; skip_pause=true ;;
                 9) manage_cloudflare_tunnel; skip_pause=true ;;
                 10) manage_port_forwarding; skip_pause=true ;;
@@ -26856,6 +27247,26 @@ case "${1:-}" in
         self_check
         exit $?
         ;;
+    --core-start)
+        init_db
+        core_control start "${2:-all}"
+        exit $?
+        ;;
+    --core-stop)
+        init_db
+        core_control stop "${2:-all}"
+        exit $?
+        ;;
+    --core-restart)
+        init_db
+        core_control restart "${2:-all}"
+        exit $?
+        ;;
+    --core-status)
+        init_db
+        show_core_runtime_status
+        exit 0
+        ;;
     --setup-expire-cron)
         # 安装过期检查定时任务
         init_db
@@ -26869,6 +27280,10 @@ case "${1:-}" in
         echo "  --sync-traffic       同步流量数据到数据库 (用于定时任务)"
         echo "  --show-traffic       显示实时流量统计"
         echo "  --check-expire       检查并禁用过期用户 (用于定时任务)"
+        echo "  --core-start [目标]  启动核心，目标: xray|singbox|all (默认 all)"
+        echo "  --core-stop [目标]   停止核心，目标: xray|singbox|all (默认 all)"
+        echo "  --core-restart [目标] 重启核心，目标: xray|singbox|all (默认 all)"
+        echo "  --core-status        查看 Xray/Sing-box 核心状态"
         echo "  --setup-expire-cron  安装过期检查定时任务"
         echo "  --self-check         检查脚本、依赖、权限和数据库"
         echo "  --help, -h           显示帮助信息"
