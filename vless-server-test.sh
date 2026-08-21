@@ -1,4 +1,11 @@
 #!/bin/sh
+
+# 所有发行版/cron/OpenRC/systemd 共用的基础 PATH。
+# 必须放在 Bash 检测之前：Alpine 首次由 /bin/sh 启动时也可能处于精简 PATH。
+VLESS_BASE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PATH="${VLESS_BASE_PATH}${PATH:+:${PATH}}"
+export VLESS_BASE_PATH PATH
+
 # POSIX 启动引导：Alpine 默认可能没有 bash。
 # 先用 /bin/sh 启动，仅在进入 Bash 专用语法前完成检测/安装并重新执行。
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -21,8 +28,9 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
+
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.6.1 [服务端]
+#  多协议代理一键部署脚本 v3.6.2 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -40,7 +48,7 @@ fi
 #  项目地址: https://github.com/jet3918/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.6.1"
+readonly VERSION="3.6.2"
 readonly AUTHOR="jet3918"
 readonly REPO_URL="https://github.com/jet3918/vless-all-in-one"
 readonly SCRIPT_REPO="jet3918/vless-all-in-one"
@@ -2478,7 +2486,10 @@ build_cron_command() {
     local bash_path
     bash_path=$(get_bash_interpreter)
     [[ -z "$bash_path" ]] && return 1
-    printf '%s %q %q %s >> %q 2>&1' "$schedule" "$bash_path" "$script_path" "$subcommand" "$log_file"
+
+    # cron 在 Debian/Ubuntu/Alpine 上都可能使用精简 PATH。
+    # 这里把运行环境写进每一条任务，避免依赖登录 shell。
+    printf '%s PATH=%s HOME=/root %q %q %s >> %q 2>&1'         "$schedule" "$VLESS_BASE_PATH" "$bash_path" "$script_path" "$subcommand" "$log_file"
 }
 
 install_cron_entry() {
@@ -2504,13 +2515,60 @@ remove_cron_entry() {
 }
 
 ensure_cron_service_running() {
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service cronie start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
-        rc-update add cronie default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
-    elif command -v systemctl >/dev/null 2>&1; then
-        systemctl enable cron >/dev/null 2>&1 || systemctl enable crond >/dev/null 2>&1 || true
-        systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1 || true
+    # 确保 crontab 命令存在
+    if ! command -v crontab >/dev/null 2>&1; then
+        case "$DISTRO" in
+            alpine)
+                _info "未检测到 crontab，正在为 Alpine 安装 cron..."
+                apk add --no-cache cronie >/dev/null 2>&1 ||                     apk add --no-cache dcron >/dev/null 2>&1 || {
+                        _err "Alpine cron 安装失败，请执行: apk add --no-cache cronie"
+                        return 1
+                    }
+                ;;
+            debian|ubuntu)
+                _info "未检测到 crontab，正在安装 cron..."
+                DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+                DEBIAN_FRONTEND=noninteractive apt-get install -y cron >/dev/null 2>&1 || {
+                    _err "cron 安装失败，请执行: apt-get install -y cron"
+                    return 1
+                }
+                ;;
+            *)
+                _err "当前系统缺少 crontab，请先安装 cron/cronie"
+                return 1
+                ;;
+        esac
     fi
+
+    case "$DISTRO" in
+        alpine)
+            # Alpine 的 cronie / dcron / BusyBox cron 通常都以 crond 服务名运行。
+            if command -v rc-service >/dev/null 2>&1; then
+                rc-service crond start >/dev/null 2>&1 ||                     rc-service cronie start >/dev/null 2>&1 || true
+                rc-update add crond default >/dev/null 2>&1 ||                     rc-update add cronie default >/dev/null 2>&1 || true
+            fi
+            ;;
+        debian|ubuntu)
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl enable cron >/dev/null 2>&1 || systemctl enable crond >/dev/null 2>&1 || true
+                systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1 || true
+            elif command -v service >/dev/null 2>&1; then
+                service cron start >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
+            fi
+            ;;
+        *)
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl enable crond >/dev/null 2>&1 || systemctl enable cron >/dev/null 2>&1 || true
+                systemctl start crond >/dev/null 2>&1 || systemctl start cron >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+
+    command -v crontab >/dev/null 2>&1 || {
+        _err "crontab 仍不可用"
+        return 1
+    }
+    return 0
 }
 
 
@@ -2526,8 +2584,8 @@ setup_traffic_cron() {
     log_file="$CFG/traffic-sync.log"
     cron_cmd="$(build_cron_command "*/$interval * * * *" "$script_path" "--sync-traffic" "$log_file") # sync-traffic"
 
-    # 确保 cron 服务已启动
-    ensure_cron_service_running
+    # 确保 cron 服务已安装并启动
+    ensure_cron_service_running || return 1
 
     if install_cron_entry "sync-traffic" "$cron_cmd"; then
         set_traffic_interval "$interval"
@@ -4643,7 +4701,14 @@ get_protocol() {
 
 
 check_root()      { [[ $EUID -ne 0 ]] && { _err "请使用 root 权限运行"; exit 1; }; }
-check_cmd()       { command -v "$1" &>/dev/null; }
+check_cmd() {
+    local cmd="$1" d
+    command -v "$cmd" &>/dev/null && return 0
+    for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        [[ -x "$d/$cmd" ]] && return 0
+    done
+    return 1
+}
 check_installed() { [[ -d "$CFG" && ( -f "$CFG/config.json" || -f "$CFG/db.json" ) ]]; }
 get_role()        { [[ -f "$CFG/role" ]] && cat "$CFG/role" || echo ""; }
 is_paused()       { [[ -f "$CFG/paused" ]]; }
@@ -11345,6 +11410,29 @@ _core_service_name() {
     esac
 }
 
+_core_binary_path() {
+    local core="$1" candidate
+    case "$core" in
+        xray)
+            for candidate in /usr/local/bin/xray /usr/bin/xray /opt/xray/xray; do
+                [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
+            done
+            candidate=$(command -v xray 2>/dev/null || true)
+            ;;
+        singbox)
+            for candidate in /usr/local/bin/sing-box /usr/bin/sing-box /opt/sing-box/sing-box; do
+                [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
+            done
+            candidate=$(command -v sing-box 2>/dev/null || true)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    [[ -n "$candidate" && -x "$candidate" ]] || return 1
+    echo "$candidate"
+}
+
 _core_protocols() {
     case "$1" in
         xray) get_xray_protocols ;;
@@ -11359,34 +11447,39 @@ _core_has_configured_protocols() {
 }
 
 _core_prepare() {
-    local core="$1" protocols first_proto
+    local core="$1" protocols first_proto core_bin
     protocols=$(_core_protocols "$core" 2>/dev/null)
     [[ -n "$protocols" ]] || {
         _err "$(_core_display_name "$core") 没有已配置协议，无法启动核心"
         return 1
     }
 
+    core_bin=$(_core_binary_path "$core" 2>/dev/null || true)
+    [[ -n "$core_bin" ]] || {
+        _err "未检测到 $(_core_display_name "$core") 核心（已检查 /usr/local/bin、/usr/bin 和 PATH）"
+        return 1
+    }
+
     case "$core" in
         xray)
-            check_cmd xray || { _err "未检测到 Xray 核心"; return 1; }
             _info "生成并检查 Xray 配置..."
             generate_xray_config || { _err "Xray 配置生成失败"; return 1; }
-            if ! xray run -test -c "$CFG/config.json" >/dev/null 2>&1; then
+            if ! "$core_bin" run -test -c "$CFG/config.json" >/dev/null 2>&1; then
                 _err "Xray 配置检查失败，已取消启动/重启"
-                xray run -test -c "$CFG/config.json" 2>&1 | tail -n 20
+                "$core_bin" run -test -c "$CFG/config.json" 2>&1 | tail -n 20
                 return 1
             fi
-            first_proto=$(printf '%s\n' "$protocols" | awk 'NF{print $1; exit}')
+            first_proto=$(printf '%s
+' "$protocols" | awk 'NF{print $1; exit}')
             [[ -n "$first_proto" ]] || return 1
             create_service "$first_proto" || { _err "Xray 服务文件创建失败"; return 1; }
             ;;
         singbox)
-            check_cmd sing-box || { _err "未检测到 Sing-box 核心"; return 1; }
             _info "生成并检查 Sing-box 配置..."
             generate_singbox_config || { _err "Sing-box 配置生成失败"; return 1; }
-            if ! sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
+            if ! "$core_bin" check -c "$CFG/singbox.json" >/dev/null 2>&1; then
                 _err "Sing-box 配置检查失败，已取消启动/重启"
-                sing-box check -c "$CFG/singbox.json" 2>&1 | tail -n 20
+                "$core_bin" check -c "$CFG/singbox.json" 2>&1 | tail -n 20
                 return 1
             fi
             create_server_scripts
@@ -11636,9 +11729,9 @@ setup_core_restart_cron() {
     [[ -n "$bash_path" ]] || { _err "未找到 bash，无法写入定时任务"; return 1; }
     log_file="$CORE_RESTART_LOG_FILE"
     touch "$log_file" 2>/dev/null || true
-    cron_cmd="* * * * * $bash_path $script_path --cron-core-restart-check >> $log_file 2>&1 # core-restart"
+    cron_cmd="$(build_cron_command "* * * * *" "$script_path" "--cron-core-restart-check" "$log_file") # core-restart"
 
-    ensure_cron_service_running
+    ensure_cron_service_running || return 1
     if install_cron_entry "core-restart" "$cron_cmd"; then
         cat > "$CORE_RESTART_SCHEDULE_FILE" << EOF
 hours=$normalized
@@ -11647,6 +11740,7 @@ EOF
         rm -f "$CORE_RESTART_LASTRUN_FILE" 2>/dev/null || true
         _ok "已启用核心定时重启：$(_core_schedule_format_hours "$normalized")"
         echo -e "  ${D}执行对象: 全部已配置核心（Xray / Sing-box）${NC}"
+        echo -e "  ${D}运行 PATH: $VLESS_BASE_PATH${NC}"
         echo -e "  ${D}日志: $log_file${NC}"
         return 0
     fi
@@ -11672,40 +11766,51 @@ show_core_restart_schedule_status() {
 }
 
 run_core_restart_schedule_check() {
+    # cron / crond 是非登录环境：再次显式固定 PATH，避免发行版差异。
+    export PATH="${VLESS_BASE_PATH}${PATH:+:${PATH}}"
+
+    # 上海当前全年 UTC+8，无夏令时。使用 POSIX TZ 字符串可避免 Alpine 最小系统缺少 tzdata。
+    export TZ="CST-8"
+
     init_db
-    local hours stamp current_hm current_hour current_datehour
+    local hours stamp current_hm current_hour current_datehour now_text
     hours=$(_core_schedule_load_hours 2>/dev/null || true)
     [[ -n "$hours" ]] || exit 0
 
-    current_hm=$(TZ=Asia/Shanghai date '+%H:%M' 2>/dev/null)
-    [[ "$current_hm" == "00:00" || "$current_hm" == "12:00" || "$current_hm" == *':00' ]] || exit 0
+    current_hm=$(date '+%H:%M' 2>/dev/null)
     [[ "${current_hm#*:}" == "00" ]] || exit 0
-    current_hour=$(TZ=Asia/Shanghai date '+%H' 2>/dev/null)
+
+    current_hour=$(date '+%H' 2>/dev/null)
     current_hour=$((10#$current_hour))
     case ",$hours," in
         *",$current_hour,"*) ;;
         *) exit 0 ;;
     esac
 
-    current_datehour=$(TZ=Asia/Shanghai date '+%Y-%m-%d-%H' 2>/dev/null)
+    current_datehour=$(date '+%Y-%m-%d-%H' 2>/dev/null)
     if [[ -f "$CORE_RESTART_LASTRUN_FILE" ]]; then
         stamp=$(cat "$CORE_RESTART_LASTRUN_FILE" 2>/dev/null)
         [[ "$stamp" == "$current_datehour" ]] && exit 0
     fi
 
-    echo "[$(TZ=Asia/Shanghai date '+%F %T %Z')] 触发核心定时重启：$(_core_schedule_format_hours "$hours")"
+    now_text=$(date '+%F %T CST' 2>/dev/null)
+    echo "[$now_text] 触发核心定时重启：$(_core_schedule_format_hours "$hours")"
+
     if is_paused; then
-        echo "[$(TZ=Asia/Shanghai date '+%F %T %Z')] 检测到全局暂停标记，跳过本次定时重启"
+        echo "[$now_text] 检测到全局暂停标记，跳过本次定时重启"
         echo "$current_datehour" > "$CORE_RESTART_LASTRUN_FILE"
         exit 0
     fi
 
     if core_control restart all; then
         echo "$current_datehour" > "$CORE_RESTART_LASTRUN_FILE"
-        echo "[$(TZ=Asia/Shanghai date '+%F %T %Z')] 核心定时重启完成"
+        now_text=$(date '+%F %T CST' 2>/dev/null)
+        echo "[$now_text] 核心定时重启完成"
         exit 0
     fi
-    echo "[$(TZ=Asia/Shanghai date '+%F %T %Z')] 核心定时重启失败"
+
+    now_text=$(date '+%F %T CST' 2>/dev/null)
+    echo "[$now_text] 核心定时重启失败"
     exit 1
 }
 
@@ -27479,6 +27584,28 @@ case "${1:-}" in
         show_core_runtime_status
         exit 0
         ;;
+    --core-cron-env-check)
+        # 模拟 cron 的精简环境，检查核心二进制和服务管理器是否可见
+        export PATH="$VLESS_BASE_PATH"
+        echo "PATH=$PATH"
+        echo "DISTRO=$DISTRO"
+        if bin=$(_core_binary_path xray 2>/dev/null); then
+            echo "Xray=$bin"
+        else
+            echo "Xray=NOT_FOUND"
+        fi
+        if bin=$(_core_binary_path singbox 2>/dev/null); then
+            echo "Sing-box=$bin"
+        else
+            echo "Sing-box=NOT_FOUND"
+        fi
+        if [[ "$DISTRO" == "alpine" ]]; then
+            command -v rc-service >/dev/null 2>&1 && echo "ServiceManager=OpenRC" || echo "ServiceManager=NOT_FOUND"
+        else
+            command -v systemctl >/dev/null 2>&1 && echo "ServiceManager=systemd" || echo "ServiceManager=NOT_FOUND"
+        fi
+        exit 0
+        ;;
     --core-restart-schedule)
         init_db
         setup_core_restart_cron "${2:-0,12}"
@@ -27509,6 +27636,7 @@ case "${1:-}" in
         echo "  --core-stop [目标]   停止核心，目标: xray|singbox|all (默认 all)"
         echo "  --core-restart [目标] 重启核心，目标: xray|singbox|all (默认 all)"
         echo "  --core-status        查看 Xray/Sing-box 核心状态"
+        echo "  --core-cron-env-check 模拟 cron 环境检查核心路径/服务管理器"
         echo "  --core-restart-schedule [小时列表]  设置核心定时重启，如 0,12 或 3"
         echo "  --core-restart-schedule-off        关闭核心定时重启"
         echo "  --setup-expire-cron  安装过期检查定时任务"
