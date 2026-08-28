@@ -30,7 +30,7 @@ fi
 
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.6.2 [服务端]
+#  多协议代理一键部署脚本 v3.6.3 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -48,7 +48,7 @@ fi
 #  项目地址: https://github.com/jet3918/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.6.2"
+readonly VERSION="3.6.3"
 readonly AUTHOR="jet3918"
 readonly REPO_URL="https://github.com/jet3918/vless-all-in-one"
 readonly SCRIPT_REPO="jet3918/vless-all-in-one"
@@ -14758,8 +14758,11 @@ _add_routing_rule() {
         db_add_routing_rule "$rule_type" "block"
         _ok "已添加规则: 广告屏蔽 → 拦截"
         _info "更新代理配置..."
-        _regenerate_proxy_configs
-        _ok "配置已更新"
+        if _regenerate_proxy_configs; then
+            _ok "配置已更新"
+        else
+            _err "配置更新失败，请查看上方错误信息"
+        fi
         _pause
         return
     fi
@@ -14836,8 +14839,11 @@ _add_routing_rule() {
     
     # 更新配置
     _info "更新代理配置..."
-    _regenerate_proxy_configs
-    _ok "配置已更新"
+    if _regenerate_proxy_configs; then
+        _ok "配置已更新"
+    else
+        _err "配置更新失败，请查看上方错误信息"
+    fi
     _pause
 }
 
@@ -14901,25 +14907,104 @@ _del_routing_rule() {
     if [[ "$del_choice" =~ ^[0-9]+$ ]] && [[ "$del_choice" -ge 1 && "$del_choice" -le ${#rule_ids[@]} ]]; then
         local del_id="${rule_ids[$((del_choice-1))]}"
         db_del_routing_rule "$del_id"
-        _regenerate_proxy_configs
-        _ok "已删除规则"
+        if _regenerate_proxy_configs; then
+            _ok "已删除规则"
+        else
+            _err "规则已从数据库删除，但配置重载失败，请检查核心日志"
+        fi
     fi
     _pause
 }
 
 # 重新生成代理配置的辅助函数
+# v3.6.3: 生成 -> 核心语法校验 -> 重启；任何一步失败都会恢复旧配置，避免“显示成功但实际未生效”。
 _regenerate_proxy_configs() {
+    local failed=0
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
-        generate_xray_config
-        svc restart vless-reality 2>/dev/null
+        local xray_backup="" xray_bin=""
+        [[ -f "$CFG/config.json" ]] && { xray_backup=$(mktemp); cp -f "$CFG/config.json" "$xray_backup"; }
+
+        if ! generate_xray_config; then
+            _err "Xray 配置生成失败"
+            [[ -n "$xray_backup" && -f "$xray_backup" ]] && cp -f "$xray_backup" "$CFG/config.json"
+            rm -f "$xray_backup" 2>/dev/null || true
+            return 1
+        fi
+
+        xray_bin=$(_core_binary_path xray 2>/dev/null || command -v xray 2>/dev/null || true)
+        if [[ -z "$xray_bin" || ! -x "$xray_bin" ]]; then
+            _err "未检测到 Xray 核心，无法验证分流配置"
+            [[ -n "$xray_backup" && -f "$xray_backup" ]] && cp -f "$xray_backup" "$CFG/config.json"
+            rm -f "$xray_backup" 2>/dev/null || true
+            return 1
+        fi
+
+        if ! "$xray_bin" run -test -c "$CFG/config.json" >/tmp/vless-xray-check.err 2>&1; then
+            _err "Xray 分流配置校验失败，已恢复旧配置"
+            tail -n 20 /tmp/vless-xray-check.err 2>/dev/null || true
+            [[ -n "$xray_backup" && -f "$xray_backup" ]] && cp -f "$xray_backup" "$CFG/config.json"
+            rm -f "$xray_backup" /tmp/vless-xray-check.err 2>/dev/null || true
+            return 1
+        fi
+        rm -f /tmp/vless-xray-check.err 2>/dev/null || true
+
+        if ! svc restart vless-reality; then
+            _err "Xray 服务重启失败，正在恢复旧配置"
+            if [[ -n "$xray_backup" && -f "$xray_backup" ]]; then
+                cp -f "$xray_backup" "$CFG/config.json"
+                svc restart vless-reality >/dev/null 2>&1 || true
+            fi
+            rm -f "$xray_backup" 2>/dev/null || true
+            return 1
+        fi
+        rm -f "$xray_backup" 2>/dev/null || true
+        _ok "Xray 分流配置已校验并生效"
     fi
-    
+
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        generate_singbox_config
-        svc restart vless-singbox 2>/dev/null
+        local sb_backup="" sb_bin=""
+        [[ -f "$CFG/singbox.json" ]] && { sb_backup=$(mktemp); cp -f "$CFG/singbox.json" "$sb_backup"; }
+
+        if ! generate_singbox_config; then
+            _err "Sing-box 配置生成失败"
+            [[ -n "$sb_backup" && -f "$sb_backup" ]] && cp -f "$sb_backup" "$CFG/singbox.json"
+            rm -f "$sb_backup" 2>/dev/null || true
+            return 1
+        fi
+
+        sb_bin=$(_core_binary_path singbox 2>/dev/null || command -v sing-box 2>/dev/null || true)
+        if [[ -z "$sb_bin" || ! -x "$sb_bin" ]]; then
+            _err "未检测到 Sing-box 核心，无法验证分流配置"
+            [[ -n "$sb_backup" && -f "$sb_backup" ]] && cp -f "$sb_backup" "$CFG/singbox.json"
+            rm -f "$sb_backup" 2>/dev/null || true
+            return 1
+        fi
+
+        if ! "$sb_bin" check -c "$CFG/singbox.json" >/tmp/vless-singbox-check.err 2>&1; then
+            _err "Sing-box 分流配置校验失败，已恢复旧配置"
+            tail -n 20 /tmp/vless-singbox-check.err 2>/dev/null || true
+            [[ -n "$sb_backup" && -f "$sb_backup" ]] && cp -f "$sb_backup" "$CFG/singbox.json"
+            rm -f "$sb_backup" /tmp/vless-singbox-check.err 2>/dev/null || true
+            return 1
+        fi
+        rm -f /tmp/vless-singbox-check.err 2>/dev/null || true
+
+        if ! svc restart vless-singbox; then
+            _err "Sing-box 服务重启失败，正在恢复旧配置"
+            if [[ -n "$sb_backup" && -f "$sb_backup" ]]; then
+                cp -f "$sb_backup" "$CFG/singbox.json"
+                svc restart vless-singbox >/dev/null 2>&1 || true
+            fi
+            rm -f "$sb_backup" 2>/dev/null || true
+            return 1
+        fi
+        rm -f "$sb_backup" 2>/dev/null || true
+        _ok "Sing-box 分流配置已校验并生效"
     fi
+
+    return 0
 }
 
 # WARP 管理菜单 (二选一模式)
@@ -15818,52 +15903,75 @@ parse_proxy_link() {
     
     case "$link" in
         socks://*|socks5://*)
-            # SOCKS5 格式: socks://[user:pass@]host:port#name 或 socks5://...
+            # SOCKS5 URI: socks5://[user:pass@]host:port[?params][#name]
+            # 普通 SOCKS5 是当前分流链的主要用途；查询参数先保留，避免被无条件截断。
             local content="${link#socks://}"
             content="${content#socks5://}"
-            local name="" host="" port="" username="" password="" hostport=""
-            
+            local name="" host="" port="" username="" password="" hostport="" params=""
+
             # 提取名称
-            [[ "$content" == *"#"* ]] && { name=$(urldecode "$(echo "$content" | sed 's/.*#//')"); content="${content%%#*}"; }
-            
-            # 移除查询参数
-            content="${content%%\?*}"
-            
-            # 检查是否有认证信息
+            if [[ "$content" == *"#"* ]]; then
+                name=$(urldecode "${content##*#}")
+                content="${content%%#*}"
+            fi
+
+            # 提取查询参数（普通 SOCKS5 可为空；保留 tls/sni 元数据用于兼容已有分享链接）
+            if [[ "$content" == *"?"* ]]; then
+                params="${content#*\?}"
+                content="${content%%\?*}"
+            fi
+
+            # 认证信息；URI 中特殊字符应使用百分号编码。
             if [[ "$content" == *"@"* ]]; then
-                local userinfo="${content%%@*}"
-                hostport="${content#*@}"
-                username="${userinfo%%:*}"
-                password="${userinfo#*:}"
-                # URL 解码
+                local userinfo="${content%@*}"
+                hostport="${content##*@}"
+                if [[ "$userinfo" == *":"* ]]; then
+                    username="${userinfo%%:*}"
+                    password="${userinfo#*:}"
+                else
+                    username="$userinfo"
+                    password=""
+                fi
                 username=$(urldecode "$username")
                 password=$(urldecode "$password")
             else
                 hostport="$content"
             fi
-            
-            # 解析 host:port
+
             local parsed=$(_parse_hostport "$hostport")
             host="${parsed%%|*}"
             port="${parsed##*|}"
-            
-            # 确保 port 是纯数字
+            host="${host#[}"
+            host="${host%]}"
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
-            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
-            
-            [[ -z "$name" ]] && name="SOCKS5-${host}:${port}"
-            if [[ -n "$host" && -n "$port" ]]; then
-                if [[ -n "$username" ]]; then
-                    result=$(jq -nc \
-                        --arg name "$name" --arg host "$host" --argjson port "$port" \
-                        --arg username "$username" --arg password "$password" \
-                        '{name:$name,type:"socks",server:$host,port:$port,username:$username,password:$password}')
-                else
-                    result=$(jq -nc \
-                        --arg name "$name" --arg host "$host" --argjson port "$port" \
-                        '{name:$name,type:"socks",server:$host,port:$port}')
-                fi
+            [[ -z "$host" || ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]] && return 1
+
+            local tls="false" sni=""
+            if [[ -n "$params" ]]; then
+                local param key value
+                IFS='&' read -ra _SOCKS_PARAMS <<< "$params"
+                for param in "${_SOCKS_PARAMS[@]}"; do
+                    key="${param%%=*}"
+                    value="${param#*=}"
+                    key=$(urldecode "$key")
+                    value=$(urldecode "$value")
+                    case "$key" in
+                        tls)
+                            case "${value,,}" in 1|true|yes|on) tls="true" ;; esac
+                            ;;
+                        sni|serverName|servername) sni="$value" ;;
+                    esac
+                done
             fi
+
+            [[ -z "$name" ]] && name="SOCKS5-$(_format_server_port "$host" "$port")"
+            result=$(jq -nc \
+                --arg name "$name" --arg host "$host" --argjson port "$port" \
+                --arg username "$username" --arg password "$password" \
+                --argjson tls "$tls" --arg sni "$sni" \
+                '{name:$name,type:"socks",server:$host,port:$port}
+                 + (if ($username != "" or $password != "") then {username:$username,password:$password} else {} end)
+                 + (if $tls then {tls:true,sni:$sni} else {} end)')
             ;;
         naive+https://*|naiveproxy://*)
             # NaiveProxy 格式: naive+https://user:pass@host:port#name
@@ -16177,14 +16285,23 @@ gen_xray_chain_outbound() {
     port=$(echo "$port" | tr -d '"' | tr -d ' ')
     [[ ! "$port" =~ ^[0-9]+$ ]] && { echo ""; return 1; }
     
-    # 根据 ip_mode 设置 Xray 的 domainStrategy
+    # 根据 ip_mode 设置连接上游节点时的地址解析策略。
+    # 重要：as_is/ALL 必须保持为空，不能像旧版那样落入 * 而被强制成 UseIPv4。
+    # 对 SOCKS5 来说，这个策略只用于“SOCKS5 服务器地址”的解析，
+    # 不能写进 socks settings，也不能用它强制 SOCKS5 远端如何解析目标域名。
     local domain_strategy=""
     case "$ip_mode" in
         ipv6_only|prefer_ipv6)
             domain_strategy="UseIPv6"
             ;;
-        ipv4_only|prefer_ipv4|*)
+        ipv4_only|prefer_ipv4)
             domain_strategy="UseIPv4"
+            ;;
+        as_is|asis|"")
+            domain_strategy=""
+            ;;
+        *)
+            domain_strategy=""
             ;;
     esac
     
@@ -16209,19 +16326,36 @@ gen_xray_chain_outbound() {
         socks)
             local username=$(echo "$node" | jq -r '.username // ""')
             local password=$(echo "$node" | jq -r '.password // ""')
+            local socks_tls=$(echo "$node" | jq -r '.tls // false')
+            local socks_sni=$(echo "$node" | jq -r '.sni // ""')
             local base_out=""
-            if [[ -n "$username" && -n "$password" ]]; then
+
+            # 本次修复目标是标准明文 SOCKS5。若节点显式要求 TLS，则按 TLS 构建传输层。
+
+            # 使用 Xray 当前文档推荐的 SOCKS5 client settings：
+            # address / port / user / pass。
+            # 旧版这里使用 servers[] 结构虽然部分版本兼容，但没有必要增加兼容分支。
+            if [[ -n "$username" || -n "$password" ]]; then
                 base_out=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
                     --arg user "$username" --arg pass "$password" \
-                    '{tag:$tag,protocol:"socks",settings:{servers:[{address:$server,port:$port,users:[{user:$user,pass:$pass}]}]}}')
+                    '{tag:$tag,protocol:"socks",settings:{address:$server,port:$port,user:$user,pass:$pass},streamSettings:{network:"tcp"}}')
             else
                 base_out=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
-                    '{tag:$tag,protocol:"socks",settings:{servers:[{address:$server,port:$port}]}}')
+                    '{tag:$tag,protocol:"socks",settings:{address:$server,port:$port},streamSettings:{network:"tcp"}}')
             fi
-            # 添加 IPv6 策略和 dialerProxy
-            if [[ -n "$domain_strategy" ]]; then
-                base_out=$(echo "$base_out" | jq --arg ds "$domain_strategy" '.settings.domainStrategy = $ds')
+
+            if [[ "$socks_tls" == "true" ]]; then
+                [[ -z "$socks_sni" ]] && socks_sni="$server"
+                base_out=$(echo "$base_out" | jq --arg sni "$socks_sni" '.streamSettings.security="tls" | .streamSettings.tlsSettings={serverName:$sni}')
             fi
+
+            # SOCKS outbound 的 settings 不支持 domainStrategy。
+            # 如上游 SOCKS5 地址是域名，仅通过 sockopt 控制“上游服务器地址”解析；
+            # IPv4/IPv6 字面量无需任何 DNS 策略，避免 IPv6 SOCKS 被 ALL/IPv4 策略误伤。
+            if [[ -n "$domain_strategy" && ! "$server" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$server" != *:* ]]; then
+                base_out=$(echo "$base_out" | jq --arg ds "$domain_strategy" '.streamSettings.sockopt.domainStrategy = $ds')
+            fi
+
             _add_dialer_proxy "$base_out"
             ;;
         http)
@@ -16370,14 +16504,21 @@ gen_singbox_chain_outbound() {
     local server=$(echo "$node" | jq -r '.server')
     local port=$(echo "$node" | jq -r '.port')
     
-    # 根据 ip_mode 设置 Sing-box 的 domain_strategy
-    local domain_strategy="prefer_ipv4"
+    # 根据 ip_mode 设置 Sing-box 的上游地址解析策略。
+    # as_is/ALL 不强制 IPv4/IPv6，避免 IPv6-only SOCKS5 节点被错误限制。
+    local domain_strategy=""
     case "$ip_mode" in
         ipv6_only|prefer_ipv6)
             domain_strategy="prefer_ipv6"
             ;;
-        ipv4_only|prefer_ipv4|*)
+        ipv4_only|prefer_ipv4)
             domain_strategy="prefer_ipv4"
+            ;;
+        as_is|asis|"")
+            domain_strategy=""
+            ;;
+        *)
+            domain_strategy=""
             ;;
     esac
     
@@ -16385,14 +16526,19 @@ gen_singbox_chain_outbound() {
         socks)
             local username=$(echo "$node" | jq -r '.username // ""')
             local password=$(echo "$node" | jq -r '.password // ""')
-            if [[ -n "$username" && -n "$password" ]]; then
-                jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
-                    --arg user "$username" --arg pass "$password" --arg ds "$domain_strategy" \
-                    '{tag:$tag,type:"socks",server:$server,server_port:$port,username:$user,password:$pass,domain_strategy:$ds}'
+            local base=""
+            if [[ -n "$username" || -n "$password" ]]; then
+                base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                    --arg user "$username" --arg pass "$password" \
+                    '{tag:$tag,type:"socks",server:$server,server_port:$port,username:$user,password:$pass}')
             else
-                jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg ds "$domain_strategy" \
-                    '{tag:$tag,type:"socks",server:$server,server_port:$port,domain_strategy:$ds}'
+                base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                    '{tag:$tag,type:"socks",server:$server,server_port:$port}')
             fi
+            if [[ -n "$domain_strategy" && ! "$server" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$server" != *:* ]]; then
+                base=$(echo "$base" | jq --arg ds "$domain_strategy" '.domain_strategy = $ds')
+            fi
+            echo "$base"
             ;;
         http)
             local username=$(echo "$node" | jq -r '.username // ""')
@@ -27584,6 +27730,15 @@ case "${1:-}" in
         show_core_runtime_status
         exit 0
         ;;
+    --debug-chain-outbound)
+        init_db
+        node_name="${2:-}"
+        [[ -z "$node_name" ]] && { echo "用法: $0 --debug-chain-outbound 节点名 [as_is|ipv4_only|ipv6_only]"; exit 1; }
+        mode="${3:-as_is}"
+        out=$(gen_xray_chain_outbound "$node_name" "debug-chain" "$mode") || exit 1
+        echo "$out" | jq .
+        exit 0
+        ;;
     --core-cron-env-check)
         # 模拟 cron 的精简环境，检查核心二进制和服务管理器是否可见
         export PATH="$VLESS_BASE_PATH"
@@ -27636,6 +27791,7 @@ case "${1:-}" in
         echo "  --core-stop [目标]   停止核心，目标: xray|singbox|all (默认 all)"
         echo "  --core-restart [目标] 重启核心，目标: xray|singbox|all (默认 all)"
         echo "  --core-status        查看 Xray/Sing-box 核心状态"
+        echo "  --debug-chain-outbound 节点名 [模式]  输出链式代理 Xray outbound（排错用）"
         echo "  --core-cron-env-check 模拟 cron 环境检查核心路径/服务管理器"
         echo "  --core-restart-schedule [小时列表]  设置核心定时重启，如 0,12 或 3"
         echo "  --core-restart-schedule-off        关闭核心定时重启"
