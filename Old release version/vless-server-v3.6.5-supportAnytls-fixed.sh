@@ -9560,51 +9560,76 @@ def fetch(name: str) -> str:
         return resp.read().decode('utf-8', 'ignore')
 
 
-def norm_token(token: str) -> str:
-    token = token.strip()
-    if '@' in token:
-        token = token.split('@', 1)[0].strip()
-    if ' ' in token:
-        token = token.split()[0].strip()
-    return token.strip()
+def parse_entry(raw_line: str):
+    line = raw_line.strip()
+    if not line or line.startswith('#'):
+        return None, set()
+    if '#' in line:
+        line = line.split('#', 1)[0].strip()
+    if not line:
+        return None, set()
+    parts = line.split()
+    main = parts[0].strip()
+    attrs = set()
+    if '@' in main:
+        main, inline_attr = main.split('@', 1)
+        main = main.strip()
+        if inline_attr.strip():
+            attrs.add(inline_attr.strip().lower())
+    for extra in parts[1:]:
+        if extra.startswith('@') and len(extra) > 1:
+            attrs.add(extra[1:].strip().lower())
+    return main, attrs
 
 
-def load(name: str):
-    if not name or name in seen:
+def match_attr_filter(entry_attrs: set, required_attr: str) -> bool:
+    if not required_attr:
+        return True
+    if required_attr.startswith('!'):
+        return required_attr[1:] not in entry_attrs
+    return required_attr in entry_attrs
+
+
+def load(name: str, required_attr: str = ''):
+    key = (name, required_attr)
+    if not name or key in seen:
         return
-    seen.add(name)
+    seen.add(key)
     text = fetch(name)
     for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith('#'):
+        main, attrs = parse_entry(raw)
+        if not main:
             continue
-        if '# ' in line:
-            line = line.split('#', 1)[0].strip()
-        line = norm_token(line)
-        if not line:
+        if main.startswith('include:'):
+            inc_target = main.split(':', 1)[1].strip()
+            inc_attr = required_attr
+            if attrs:
+                # 若 include 行自身携带 @attr，优先按该属性过滤
+                inc_attr = next(iter(attrs))
+            load(inc_target, inc_attr)
             continue
-        if line.startswith('include:'):
-            load(norm_token(line.split(':', 1)[1]))
-        elif line.startswith('full:'):
-            v = norm_token(line.split(':', 1)[1])
+        if not match_attr_filter(attrs, required_attr):
+            continue
+        if main.startswith('full:'):
+            v = main.split(':', 1)[1].strip()
             if v:
                 full.add(v)
-        elif line.startswith('regexp:'):
-            v = line.split(':', 1)[1].strip()
+        elif main.startswith('regexp:'):
+            v = main.split(':', 1)[1].strip()
             if v:
                 regex.add(v)
-        elif line.startswith('keyword:'):
-            v = norm_token(line.split(':', 1)[1])
+        elif main.startswith('keyword:'):
+            v = main.split(':', 1)[1].strip()
             if v:
                 keyword.add(v)
-        elif line.startswith('domain:'):
-            v = norm_token(line.split(':', 1)[1]).lstrip('.')
+        elif main.startswith('domain:'):
+            v = main.split(':', 1)[1].strip().lstrip('.')
             if v:
                 suffix.add(v)
-        elif line.startswith('exclude:'):
+        elif main.startswith('exclude:'):
             continue
         else:
-            v = norm_token(line).lstrip('.')
+            v = main.lstrip('.')
             if v:
                 suffix.add(v)
 
@@ -9682,6 +9707,22 @@ _build_singbox_ruleset() {
     esac
 }
 
+_singbox_ruleset_remote_url() {
+    local tag="$1"
+    case "$tag" in
+        geosite-tracker) return 1 ;;
+        geosite-*)
+            printf 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/%s.srs\n' "$tag"
+            return 0
+            ;;
+        geoip-*)
+            printf 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/%s.srs\n' "$tag"
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 _list_missing_singbox_rulesets_from_routing_rules() {
     local routing_rules="$1"
     [[ -z "$routing_rules" || "$routing_rules" == "[]" ]] && return 0
@@ -9692,6 +9733,8 @@ _list_missing_singbox_rulesets_from_routing_rules() {
 
     local tag
     for tag in $tags; do
+        # 远程规则集由 Sing-box 自动拉取缓存，无需本地预编译
+        _singbox_ruleset_remote_url "$tag" >/dev/null && continue
         local path=$(_singbox_ruleset_path "$tag")
         [[ -s "$path" ]] || echo "$tag"
     done
@@ -9710,15 +9753,15 @@ _ensure_singbox_rulesets_from_routing_rules() {
     if [[ -n "$missing_tags" ]]; then
         local missing_count
         missing_count=$(printf '%s\n' "$missing_tags" | sed '/^$/d' | wc -l | tr -d ' ')
-        _info "正在准备 Sing-box 规则集缓存 (${missing_count} 项)..."
-        _warn "首次启用或缓存缺失时，需要下载并编译规则集，可能耗时 30~120 秒，请耐心等待"
+        _info "正在准备 Sing-box 本地规则集 (${missing_count} 项)..."
     fi
 
     local tag
     for tag in $tags; do
+        _singbox_ruleset_remote_url "$tag" >/dev/null && continue
         local path=$(_singbox_ruleset_path "$tag")
         if [[ ! -s "$path" ]]; then
-            _info "生成规则集: $tag"
+            _info "生成本地规则集: $tag"
             _build_singbox_ruleset "$tag" || {
                 _err "生成 Sing-box 规则集失败: $tag"
                 return 1
@@ -9735,10 +9778,17 @@ _build_singbox_ruleset_defs() {
     local tags=$(echo "$routing_rules" | jq -r '.[]? | .rule_set[]?' 2>/dev/null | sort -u)
     [[ -z "$tags" ]] && { echo "[]"; return 0; }
 
-    local tag
+    local tag url
     for tag in $tags; do
-        local path=$(_singbox_ruleset_path "$tag")
-        defs=$(echo "$defs" | jq --arg tag "$tag" --arg path "$path" '. + [{type: "local", tag: $tag, format: "binary", path: $path}]')
+        if url=$(_singbox_ruleset_remote_url "$tag"); then
+            defs=$(echo "$defs" | jq \
+                --arg tag "$tag" \
+                --arg url "$url" \
+                '. + [{type: "remote", tag: $tag, format: "binary", url: $url, download_detour: "direct", update_interval: "7d"}]')
+        else
+            local path=$(_singbox_ruleset_path "$tag")
+            defs=$(echo "$defs" | jq --arg tag "$tag" --arg path "$path" '. + [{type: "local", tag: $tag, format: "binary", path: $path}]')
+        fi
     done
     echo "$defs"
 }
@@ -10104,6 +10154,11 @@ generate_singbox_config() {
         fi
         if [[ -n "$singbox_ruleset_defs" && "$singbox_ruleset_defs" != "[]" ]]; then
             base_config=$(echo "$base_config" | jq --argjson sets "$singbox_ruleset_defs" '.route.rule_set = $sets')
+            # 存在远程规则集时启用 cache_file，避免断网/源站波动影响启动
+            if echo "$singbox_ruleset_defs" | jq -e 'any(.[]; .type == "remote")' >/dev/null 2>&1; then
+                mkdir -p "$CFG/cache"
+                base_config=$(echo "$base_config" | jq --arg cp "$CFG/cache/singbox-cache.db" '.experimental.cache_file = {enabled: true, path: $cp}')
+            fi
         fi
     else
         base_config=$(jq -n --argjson direct "$direct_outbound" '{
@@ -15903,6 +15958,138 @@ setup_warp_ipv6_chain() {
 }
 
 # 分流管理主菜单
+# 一键更新分流规则库（Xray .dat + Sing-box 远程/本地规则集）
+update_routing_rulesets() {
+    _header
+    echo -e "  ${W}一键更新规则库 (Xray / Sing-box)${NC}"
+    _line
+
+    local has_xray=false has_singbox=false
+    check_cmd xray && has_xray=true
+    check_cmd sing-box && has_singbox=true
+
+    if [[ "$has_xray" == "false" && "$has_singbox" == "false" ]]; then
+        _warn "未检测到 Xray 或 Sing-box 核心"
+        _pause
+        return 0
+    fi
+
+    echo -e "  ${C}当前规则库状态:${NC}"
+    if [[ "$has_xray" == "true" ]]; then
+        local f
+        for f in geosite.dat geoip.dat; do
+            local fp="${XRAY_ASSET_DIR}/${f}"
+            if [[ -s "$fp" ]]; then
+                local mtime size
+                mtime=$(date -r "$fp" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "未知")
+                size=$(du -h "$fp" 2>/dev/null | awk '{print $1}')
+                echo -e "  • Xray ${f}: ${G}${size}${NC} (更新于 ${mtime})"
+            else
+                echo -e "  • Xray ${f}: ${Y}未找到${NC}"
+            fi
+        done
+    fi
+    if [[ "$has_singbox" == "true" ]]; then
+        local cache_db="$CFG/cache/singbox-cache.db"
+        if [[ -s "$cache_db" ]]; then
+            local cmtime csize
+            cmtime=$(date -r "$cache_db" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "未知")
+            csize=$(du -h "$cache_db" 2>/dev/null | awk '{print $1}')
+            echo -e "  • Sing-box 远程规则缓存: ${G}${csize}${NC} (更新于 ${cmtime}，自动周期 7 天)"
+        else
+            echo -e "  • Sing-box 远程规则缓存: ${D}尚未生成 (Sing-box 启动后自动拉取)${NC}"
+        fi
+        local local_srs_cnt=$(find "$CFG/ruleset" -maxdepth 1 -name '*.srs' -type f 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "${local_srs_cnt:-0}" -gt 0 ]]; then
+            echo -e "  • Sing-box 本地规则集: ${G}${local_srs_cnt} 项${NC}"
+        fi
+    fi
+
+    _line
+    read -rp "  确认立即更新规则库? [Y/n]: " confirm
+    [[ "$confirm" =~ ^[nN]$ ]] && return 0
+    echo ""
+
+    # 1. 更新 Xray geosite.dat / geoip.dat（SHA256 校验 + 原子替换 + 失败回滚）
+    if [[ "$has_xray" == "true" ]]; then
+        _info "正在更新 Xray 规则库 (Loyalsoldier/v2ray-rules-dat)..."
+        mkdir -p "$XRAY_ASSET_DIR"
+        local tmp_dir
+        tmp_dir=$(mktemp -d)
+        local base_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
+        local xray_ok=true
+        local f expected_sha
+
+        for f in geosite.dat geoip.dat; do
+            expected_sha=""
+            if curl --fail --location --silent --connect-timeout 10 --max-time 30 \
+                "${base_url}/${f}.sha256sum" -o "${tmp_dir}/${f}.sha256sum" 2>/dev/null; then
+                expected_sha=$(awk '{print $1}' "${tmp_dir}/${f}.sha256sum" | head -n 1)
+                [[ "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]] || expected_sha=""
+            fi
+            if ! download_file_checked "${base_url}/${f}" "${tmp_dir}/${f}" auto "$expected_sha"; then
+                _err "下载或校验 Xray ${f} 失败"
+                xray_ok=false
+                break
+            fi
+        done
+
+        if [[ "$xray_ok" == "true" ]]; then
+            for f in geosite.dat geoip.dat; do
+                [[ -f "${XRAY_ASSET_DIR}/${f}" ]] && cp -f "${XRAY_ASSET_DIR}/${f}" "${tmp_dir}/${f}.bak"
+                install -m 644 "${tmp_dir}/${f}" "${XRAY_ASSET_DIR}/${f}"
+            done
+
+            local xray_bin
+            xray_bin=$(_core_binary_path xray 2>/dev/null || command -v xray 2>/dev/null || true)
+            if [[ -f "$CFG/config.json" && -n "$xray_bin" && -x "$xray_bin" ]] && ! "$xray_bin" run -test -c "$CFG/config.json" >/dev/null 2>&1; then
+                _err "新 Xray 规则库配置校验失败，已自动回滚旧版本"
+                for f in geosite.dat geoip.dat; do
+                    [[ -f "${tmp_dir}/${f}.bak" ]] && mv -f "${tmp_dir}/${f}.bak" "${XRAY_ASSET_DIR}/${f}"
+                done
+            else
+                _ok "Xray 规则库 (geosite.dat / geoip.dat) 更新成功"
+                if [[ -n "$(get_xray_protocols)" ]] && svc status vless-reality >/dev/null 2>&1; then
+                    svc restart vless-reality >/dev/null 2>&1 && _ok "Xray 服务已重启生效" || _warn "Xray 服务重启失败，请手动检查"
+                fi
+            fi
+        fi
+        rm -rf "$tmp_dir"
+    fi
+
+    # 2. 更新 Sing-box 规则集（清空远程缓存触发立即拉新 + 重编本地复合规则集）
+    if [[ "$has_singbox" == "true" ]]; then
+        local singbox_protocols=$(get_singbox_protocols)
+        if [[ -n "$singbox_protocols" ]]; then
+            _info "正在刷新 Sing-box 规则集..."
+            # 重编可能存在的本地规则集（如 geosite-tracker）
+            rm -f "$CFG/ruleset/"*.srs "$CFG/ruleset-src/"*.json 2>/dev/null || true
+            if generate_singbox_config; then
+                local sb_bin
+                sb_bin=$(_core_binary_path singbox 2>/dev/null || command -v sing-box 2>/dev/null || true)
+                if [[ -n "$sb_bin" && -x "$sb_bin" ]] && ! "$sb_bin" check -c "$CFG/singbox.json" >/dev/null 2>&1; then
+                    _err "Sing-box 配置校验失败，已跳过重启"
+                    "$sb_bin" check -c "$CFG/singbox.json" 2>&1 | tail -n 10
+                else
+                    # 清除远程规则集缓存库，重启后 Sing-box 会立即拉取最新远程 .srs
+                    rm -f "$CFG/cache/singbox-cache.db" 2>/dev/null || true
+                    if svc status vless-singbox >/dev/null 2>&1; then
+                        svc restart vless-singbox >/dev/null 2>&1 && _ok "Sing-box 规则集已刷新并重启生效" || _warn "Sing-box 服务重启失败，请手动检查"
+                    else
+                        _ok "Sing-box 规则集配置已刷新（将在下次启动时拉取最新规则）"
+                    fi
+                fi
+            else
+                _err "Sing-box 配置重建失败"
+            fi
+        else
+            _info "当前未安装 Sing-box 协议，跳过 Sing-box 规则集刷新"
+        fi
+    fi
+
+    _pause
+}
+
 manage_routing() {
     while true; do
         _header
@@ -15917,6 +16104,7 @@ manage_routing() {
         _item "6" "访问限制"
         _item "7" "测试分流效果"
         _item "8" "查看当前配置"
+        _item "9" "一键更新规则库 (Xray/Sing-box)"
         _item "0" "返回"
         _line
         
@@ -15948,6 +16136,7 @@ manage_routing() {
                 _line
                 read -rp "  按回车返回..." _
                 ;;
+            9) update_routing_rulesets ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac
@@ -15971,7 +16160,7 @@ _node_supports_xray() {
 _node_supports_singbox() {
     local type="$1"
     case "$type" in
-        socks|http|shadowsocks|vmess|vless|trojan|hysteria2|tuic|naive) return 0 ;;
+        socks|http|shadowsocks|vmess|vless|trojan|hysteria2|tuic|anytls|naive) return 0 ;;
     esac
     return 1
 }
