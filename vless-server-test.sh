@@ -30,11 +30,11 @@ fi
 
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.6.4 [服务端]
+#  多协议代理一键部署脚本 v3.6.5 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
-#    • Sing-box 核心: 处理 UDP/QUIC 协议 (Hysteria2/TUIC) - 低内存高效率
+#    • Sing-box 核心: 处理 Hysteria2/TUIC/AnyTLS 协议 - 低内存高效率
 #  
 #  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
@@ -48,7 +48,7 @@ fi
 #  项目地址: https://github.com/jet3918/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.6.4"
+readonly VERSION="3.6.5"
 readonly AUTHOR="jet3918"
 readonly REPO_URL="https://github.com/jet3918/vless-all-in-one"
 readonly SCRIPT_REPO="jet3918/vless-all-in-one"
@@ -57,6 +57,7 @@ readonly CFG="/etc/vless-reality"
 readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
 readonly XRAY_DEFAULT_VERSION="26.11.9"
 readonly XRAY_REALITY_MLKEM_MIN_VERSION="26.9.8"
+readonly SINGBOX_ANYTLS_MIN_VERSION="1.12.0"
 readonly XRAY_BINARY="/usr/local/bin/xray"
 readonly XRAY_ASSET_DIR="/usr/local/share/xray"
 
@@ -3382,10 +3383,10 @@ generate_xray_config() {
             direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv6"}}'
             ;;
         prefer_ipv4)
-            direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv4"}}'
+            direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv4v6"}}'
             ;;
         prefer_ipv6)
-            direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv6"}}'
+            direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv6v4"}}'
             ;;
         as_is|asis)
             direct_outbound='{"protocol": "freedom", "tag": "direct"}'
@@ -3426,7 +3427,7 @@ generate_xray_config() {
                         ;;
                     prefer_ipv6)
                         if ! echo "$outbounds" | jq -e --arg tag "direct-prefer-ipv6" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
-                            local direct_prefer_ipv6_out='{"protocol": "freedom", "tag": "direct-prefer-ipv6", "settings": {"domainStrategy": "UseIPv6"}}'
+                            local direct_prefer_ipv6_out='{"protocol": "freedom", "tag": "direct-prefer-ipv6", "settings": {"domainStrategy": "UseIPv6v4"}}'
                             outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv6_out" '. + [$out]')
                         fi
                         ;;
@@ -3438,7 +3439,7 @@ generate_xray_config() {
                         ;;
                     prefer_ipv4|*)
                         if ! echo "$outbounds" | jq -e --arg tag "direct-prefer-ipv4" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
-                            local direct_prefer_ipv4_out='{"protocol": "freedom", "tag": "direct-prefer-ipv4", "settings": {"domainStrategy": "UseIPv4"}}'
+                            local direct_prefer_ipv4_out='{"protocol": "freedom", "tag": "direct-prefer-ipv4", "settings": {"domainStrategy": "UseIPv4v6"}}'
                             outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv4_out" '. + [$out]')
                         fi
                         ;;
@@ -6165,11 +6166,60 @@ gen_tuic_link() {
     printf '%s\n' "tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&sni=${sni}&udp_relay_mode=native&allow_insecure=1#${name}"
 }
 
+_anytls_urlencode() {
+    local val="$1"
+    if command -v jq >/dev/null 2>&1; then
+        jq -rn --arg v "$val" '$v|@uri' 2>/dev/null || printf '%s' "$val"
+    else
+        printf '%s' "$val"
+    fi
+}
+
+_anytls_is_ip() {
+    local host="${1#[}"
+    host="${host%]}"
+    [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$host" == *:* ]]
+}
+
+_anytls_is_acme_trusted() {
+    local sni="$1" cert_mode="${2:-}"
+    [[ "$cert_mode" == "self" ]] && return 1
+    if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" && -n "$sni" ]]; then
+        local cert_domain
+        cert_domain=$(cat "$CFG/cert_domain" 2>/dev/null)
+        if [[ "$sni" == "$cert_domain" ]]; then
+            local issuer
+            issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null || true)
+            if [[ "$issuer" =~ (Let\'s\ Encrypt|R3|R10|R11|E1|E5|E6|ZeroSSL|Buypass|DigiCert|Comodo|GlobalSign|Google\ Trust) ]]; then
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
 gen_anytls_link() {
-    local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}"
+    local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}" cert_mode="${6:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}AnyTLS${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "anytls://${password}@${ip}:${port}?sni=${sni}&allowInsecure=1#${name}"
+    local host="$ip"
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        host="[$host]"
+    fi
+    local enc_password=$(_anytls_urlencode "$password")
+    local enc_name=$(_anytls_urlencode "$name")
+    local insecure="1"
+    if [[ "$cert_mode" == "acme" ]] || _anytls_is_acme_trusted "$sni" "$cert_mode"; then
+        insecure="0"
+    fi
+    # 遵循 anytls/anytls-go uri_scheme.md：标准参数为 insecure=0|1，sni 为 IP 时不发送 sni
+    local query=""
+    if [[ -n "$sni" ]] && ! _anytls_is_ip "$sni"; then
+        query="sni=$(_anytls_urlencode "$sni")&insecure=${insecure}"
+    else
+        query="insecure=${insecure}"
+    fi
+    printf '%s\n' "anytls://${enc_password}@${host}:${port}/?${query}#${enc_name}"
 }
 
 gen_naive_link() {
@@ -7346,7 +7396,7 @@ fix_selinux_context() {
     # 恢复文件上下文
     if command -v restorecon &>/dev/null; then
         restorecon -Rv /usr/local/bin/xray /usr/local/bin/sing-box /usr/local/bin/snell-server \
-            /usr/local/bin/snell-server-v5 /usr/local/bin/anytls-server /usr/local/bin/shadow-tls \
+            /usr/local/bin/snell-server-v5 /usr/local/bin/shadow-tls \
             /etc/vless-reality 2>/dev/null || true
     fi
     
@@ -8239,8 +8289,47 @@ _local_reality_mlkem() {
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
-# Sing-box 核心 - 统一管理 UDP/QUIC 协议 (Hy2/TUIC)
+# Sing-box 核心 - 统一管理 Hysteria2 / TUIC / AnyTLS 协议
 #═══════════════════════════════════════════════════════════════════════════════
+
+_singbox_binary_version() {
+    local bin="${1:-sing-box}"
+    local output version
+    output=$("$bin" version 2>/dev/null) || return 1
+    version=$(printf '%s\n' "$output" | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' | head -n 1)
+    [[ -n "$version" ]] || return 1
+    printf '%s\n' "$version"
+}
+
+# 校验 Sing-box 是否满足 AnyTLS 最低版本要求 (>= 1.12.0)
+ensure_singbox_anytls_version() {
+    local auto_upgrade="${1:-false}"
+    if ! check_cmd sing-box; then
+        if [[ "$auto_upgrade" == "true" ]]; then
+            install_singbox stable false
+            return $?
+        fi
+        return 1
+    fi
+    local cur_ver
+    cur_ver=$(_singbox_binary_version "sing-box") || return 0
+    if _version_gt "$SINGBOX_ANYTLS_MIN_VERSION" "${cur_ver%%-*}"; then
+        if [[ "$auto_upgrade" == "true" ]]; then
+            _warn "当前 Sing-box 版本 (v${cur_ver}) 低于 AnyTLS 最低要求 (v${SINGBOX_ANYTLS_MIN_VERSION})，正在自动升级..."
+            install_singbox stable true || return 1
+            cur_ver=$(_singbox_binary_version "sing-box") || return 1
+            if _version_gt "$SINGBOX_ANYTLS_MIN_VERSION" "${cur_ver%%-*}"; then
+                _err "升级后 Sing-box 版本 (v${cur_ver}) 仍低于 v${SINGBOX_ANYTLS_MIN_VERSION}，无法启用 AnyTLS"
+                return 1
+            fi
+            _ok "Sing-box 已升级至 v${cur_ver}"
+        else
+            _warn "当前 Sing-box 版本 (v${cur_ver}) 低于 AnyTLS 最低要求 (v${SINGBOX_ANYTLS_MIN_VERSION})，请升级 Sing-box 核心"
+            return 1
+        fi
+    fi
+    return 0
+}
 
 install_singbox() {
     local channel="${1:-stable}"
@@ -9609,35 +9698,35 @@ generate_singbox_config() {
     # 监听地址：IPv6 双栈不可用时退回 IPv4
     local listen_addr=$(_listen_addr)
     
-    # 根据设置生成 direct 出口配置
+    # 根据设置生成 direct 出口配置（Sing-box 1.12+ 标准 domain_resolver 语法）
     local direct_outbound=""
     case "$direct_ip_version" in
         ipv4|ipv4_only)
             direct_outbound=$(jq -n '{
                 type: "direct",
                 tag: "direct",
-                domain_strategy: "ipv4_only"
+                domain_resolver: {server: "local-dns", strategy: "ipv4_only"}
             }')
             ;;
         ipv6|ipv6_only)
             direct_outbound=$(jq -n '{
                 type: "direct",
                 tag: "direct",
-                domain_strategy: "ipv6_only"
+                domain_resolver: {server: "local-dns", strategy: "ipv6_only"}
             }')
             ;;
         prefer_ipv4)
             direct_outbound=$(jq -n '{
                 type: "direct",
                 tag: "direct",
-                domain_strategy: "prefer_ipv4"
+                domain_resolver: {server: "local-dns", strategy: "prefer_ipv4"}
             }')
             ;;
         prefer_ipv6)
             direct_outbound=$(jq -n '{
                 type: "direct",
                 tag: "direct",
-                domain_strategy: "prefer_ipv6"
+                domain_resolver: {server: "local-dns", strategy: "prefer_ipv6"}
             }')
             ;;
         as_is|asis|*)
@@ -9674,7 +9763,7 @@ generate_singbox_config() {
                             local direct_ipv4_out=$(jq -n '{
                                 type: "direct",
                                 tag: "direct-ipv4",
-                                domain_strategy: "ipv4_only"
+                                domain_resolver: {server: "local-dns", strategy: "ipv4_only"}
                             }')
                             outbounds=$(echo "$outbounds" | jq --argjson out "$direct_ipv4_out" '. + [$out]')
                         fi
@@ -9684,7 +9773,7 @@ generate_singbox_config() {
                             local direct_ipv6_out=$(jq -n '{
                                 type: "direct",
                                 tag: "direct-ipv6",
-                                domain_strategy: "ipv6_only"
+                                domain_resolver: {server: "local-dns", strategy: "ipv6_only"}
                             }')
                             outbounds=$(echo "$outbounds" | jq --argjson out "$direct_ipv6_out" '. + [$out]')
                         fi
@@ -9694,7 +9783,7 @@ generate_singbox_config() {
                             local direct_prefer_ipv6_out=$(jq -n '{
                                 type: "direct",
                                 tag: "direct-prefer-ipv6",
-                                domain_strategy: "prefer_ipv6"
+                                domain_resolver: {server: "local-dns", strategy: "prefer_ipv6"}
                             }')
                             outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv6_out" '. + [$out]')
                         fi
@@ -9713,7 +9802,7 @@ generate_singbox_config() {
                             local direct_prefer_ipv4_out=$(jq -n '{
                                 type: "direct",
                                 tag: "direct-prefer-ipv4",
-                                domain_strategy: "prefer_ipv4"
+                                domain_resolver: {server: "local-dns", strategy: "prefer_ipv4"}
                             }')
                             outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv4_out" '. + [$out]')
                         fi
@@ -9973,13 +10062,19 @@ generate_singbox_config() {
     local success_count=0
     
     for proto in $singbox_protocols; do
-        local cfg=$(db_get "singbox" "$proto")
-        [[ -z "$cfg" ]] && continue
-        
-        local port=$(echo "$cfg" | jq -r '.port // empty')
-        [[ -z "$port" ]] && continue
-        
-        local inbound=""
+        local proto_cfg=$(db_get "singbox" "$proto")
+        [[ -z "$proto_cfg" ]] && continue
+        local proto_idx=0
+
+        while IFS= read -r cfg; do
+            [[ -z "$cfg" ]] && continue
+            local port=$(echo "$cfg" | jq -r '.port // empty')
+            [[ -z "$port" ]] && continue
+
+            local inbound=""
+            local inbound_tag="${proto}-in"
+            [[ $proto_idx -gt 0 ]] && inbound_tag="${proto}-in-${port}"
+            ((proto_idx++))
         
         case "$proto" in
             hy2)
@@ -9997,29 +10092,26 @@ generate_singbox_config() {
                     fi
                 fi
                 
-                # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
+                # 构建用户列表：从当前配置读取用户并过滤已禁用用户，如果没有则使用默认用户
                 local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
+                local db_users=$(echo "$cfg" | jq -c '.users // []' 2>/dev/null)
                 
                 if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
-                    # 有自定义用户，为每个用户生成 {name, password}
-                    # hy2 用户的 uuid 字段存储的是密码；name 使用协议隔离后的内部统计键
-                    local default_user_json=$(jq -n --arg name "hy2-default" --arg pw "$password" '{name: $name, password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: ("hy2-" + .name), password: .uuid}))) | unique_by(.name)')
+                    # 有自定义用户，为每个启用中的用户生成 {name, password}
+                    local has_default=$(echo "$db_users" | jq -r 'any(.[]; .name == "default")' 2>/dev/null)
+                    if [[ "$has_default" == "true" ]]; then
+                        users_json=$(jq -n --argjson db_users "$db_users" '($db_users | map(select(.enabled != false) | {name: ("hy2-" + .name), password: .uuid})) | unique_by(.name)')
+                    else
+                        local default_user_json=$(jq -n --arg name "hy2-default" --arg pw "$password" '{name: $name, password: $pw}')
+                        users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map(select(.enabled != false) | {name: ("hy2-" + .name), password: .uuid}))) | unique_by(.name)')
+                    fi
                 else
                     # 没有自定义用户，使用默认密码
                     users_json=$(jq -n --arg name "hy2-default" --arg pw "$password" '[{name: $name, password: $pw}]')
                 fi
                 
                 inbound=$(jq -n \
+                    --arg tag "$inbound_tag" \
                     --argjson port "$port" \
                     --argjson users "$users_json" \
                     --arg cert "$cert_path" \
@@ -10027,7 +10119,7 @@ generate_singbox_config() {
                     --arg listen_addr "$listen_addr" \
                 '{
                     type: "hysteria2",
-                    tag: "hy2-in",
+                    tag: $tag,
                     listen: $listen_addr,
                     listen_port: $port,
                     users: $users,
@@ -10050,27 +10142,24 @@ generate_singbox_config() {
                 local key_path="$CFG/certs/tuic/server.key"
                 [[ ! -f "$cert_path" ]] && { cert_path="$CFG/certs/server.crt"; key_path="$CFG/certs/server.key"; }
                 
-                # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
+                # 构建用户列表：从当前配置读取用户并过滤已禁用用户，如果没有则使用默认用户
                 local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
+                local db_users=$(echo "$cfg" | jq -c '.users // []' 2>/dev/null)
                 
                 if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
-                    # TUIC 用户的 uuid 字段存储的是真正用户 UUID；name 使用协议隔离后的内部统计键
-                    local default_user_json=$(jq -n --arg name "tuic-default" --arg id "$uuid" --arg pw "$password" '{name: $name, uuid: $id, password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" --arg pw "$password" '([$chk_def] + ($db_users | map({name: ("tuic-" + .name), uuid: .uuid, password: $pw}))) | unique_by(.name)')
+                    local has_default=$(echo "$db_users" | jq -r 'any(.[]; .name == "default")' 2>/dev/null)
+                    if [[ "$has_default" == "true" ]]; then
+                        users_json=$(jq -n --argjson db_users "$db_users" --arg pw "$password" '($db_users | map(select(.enabled != false) | {name: ("tuic-" + .name), uuid: .uuid, password: $pw})) | unique_by(.name)')
+                    else
+                        local default_user_json=$(jq -n --arg name "tuic-default" --arg id "$uuid" --arg pw "$password" '{name: $name, uuid: $id, password: $pw}')
+                        users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" --arg pw "$password" '([$chk_def] + ($db_users | map(select(.enabled != false) | {name: ("tuic-" + .name), uuid: .uuid, password: $pw}))) | unique_by(.name)')
+                    fi
                 else
                     users_json=$(jq -n --arg name "tuic-default" --arg id "$uuid" --arg pw "$password" '[{name: $name, uuid: $id, password: $pw}]')
                 fi
                 
                 inbound=$(jq -n \
+                    --arg tag "$inbound_tag" \
                     --argjson port "$port" \
                     --argjson users "$users_json" \
                     --arg cert "$cert_path" \
@@ -10078,7 +10167,7 @@ generate_singbox_config() {
                     --arg listen_addr "$listen_addr" \
                 '{
                     type: "tuic",
-                    tag: "tuic-in",
+                    tag: $tag,
                     listen: $listen_addr,
                     listen_port: $port,
                     users: $users,
@@ -10092,55 +10181,82 @@ generate_singbox_config() {
                 }')
                 ;;
             anytls)
+                ensure_singbox_anytls_version false || continue
                 local password=$(echo "$cfg" | jq -r '.password // empty')
                 local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
-                local cert_path="$CFG/certs/server.crt"
-                local key_path="$CFG/certs/server.key"
+                local cert_mode=$(echo "$cfg" | jq -r '.cert_mode // ""')
+                local padding_scheme=$(echo "$cfg" | jq -c '.padding_scheme // empty' 2>/dev/null)
+
+                # 智能证书选择：优先匹配 ACME 真证书，否则使用 AnyTLS 独立自签证书目录，避免串用全局证书
+                local cert_path="$CFG/certs/anytls/server.crt"
+                local key_path="$CFG/certs/anytls/server.key"
+                if [[ "$cert_mode" == "acme" ]] || _anytls_is_acme_trusted "$sni" "$cert_mode"; then
+                    if [[ -f "$CFG/certs/server.crt" && -f "$CFG/certs/server.key" ]]; then
+                        cert_path="$CFG/certs/server.crt"
+                        key_path="$CFG/certs/server.key"
+                    fi
+                fi
+                if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+                    cert_path="$CFG/certs/server.crt"
+                    key_path="$CFG/certs/server.key"
+                fi
                 [[ ! -f "$cert_path" || ! -f "$key_path" ]] && continue
 
-                # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
+                # 构建用户列表：过滤已禁用用户，尊重 default 用户的禁用/改密状态
                 local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
+                local db_users=$(echo "$cfg" | jq -c '.users // []' 2>/dev/null)
 
                 if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
-                    # AnyTLS 用户的 uuid 字段存储的是真正用户密码；name 使用协议隔离后的内部统计键
-                    local default_user_json=$(jq -n --arg name "anytls-default" --arg pw "$password" '{name: $name, password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: ("anytls-" + .name), password: .uuid}))) | unique_by(.name)')
+                    local has_default=$(echo "$db_users" | jq -r 'any(.[]; .name == "default")' 2>/dev/null)
+                    if [[ "$has_default" == "true" ]]; then
+                        users_json=$(jq -n --argjson db_users "$db_users" '($db_users | map(select(.enabled != false) | {name: ("anytls-" + .name), password: .uuid})) | unique_by(.name)')
+                    else
+                        local default_user_json=$(jq -n --arg name "anytls-default" --arg pw "$password" '{name: $name, password: $pw}')
+                        users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map(select(.enabled != false) | {name: ("anytls-" + .name), password: .uuid}))) | unique_by(.name)')
+                    fi
                 else
                     users_json=$(jq -n --arg name "anytls-default" --arg pw "$password" '[{name: $name, password: $pw}]')
                 fi
 
+                local tls_server_name=""
+                if [[ -n "$sni" ]] && ! _anytls_is_ip "$sni"; then
+                    tls_server_name="$sni"
+                fi
+
                 inbound=$(jq -n \
+                    --arg tag "$inbound_tag" \
                     --argjson port "$port" \
                     --argjson users "$users_json" \
                     --arg cert "$cert_path" \
                     --arg key "$key_path" \
+                    --arg sni "$tls_server_name" \
                     --arg listen_addr "$listen_addr" \
                 '{
                     type: "anytls",
-                    tag: "anytls-in",
+                    tag: $tag,
                     listen: $listen_addr,
                     listen_port: $port,
                     users: $users,
-                    tls: {
-                        enabled: true,
-                        certificate_path: $cert,
-                        key_path: $key
-                    }
+                    tls: (
+                        {
+                            enabled: true,
+                            min_version: "1.2",
+                            certificate_path: $cert,
+                            key_path: $key
+                        } + (if $sni != "" then {server_name: $sni} else {} end)
+                    )
                 }')
+
+                if [[ -n "$padding_scheme" && "$padding_scheme" != "null" && "$padding_scheme" != "[]" ]]; then
+                    if echo "$padding_scheme" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+                        inbound=$(echo "$inbound" | jq --argjson ps "$padding_scheme" '. + {padding_scheme: $ps}')
+                    fi
+                fi
                 ;;
             ss2022|ss-legacy)
                 local password=$(echo "$cfg" | jq -r '.password // empty')
                 local default_method="2022-blake3-aes-128-gcm"
-                [[ "$p" == "ss-legacy" ]] && default_method="aes-256-gcm"
+                [[ "$proto" == "ss-legacy" ]] && default_method="aes-256-gcm"
                 local method=$(echo "$cfg" | jq -r '.method // empty')
                 [[ -z "$method" ]] && method="$default_method"
                 
@@ -10148,7 +10264,7 @@ generate_singbox_config() {
                     --argjson port "$port" \
                     --arg method "$method" \
                     --arg password "$password" \
-                    --arg tag "${p}-in" \
+                    --arg tag "$inbound_tag" \
                     --arg listen_addr "$listen_addr" \
                 '{
                     type: "shadowsocks",
@@ -10165,6 +10281,7 @@ generate_singbox_config() {
             inbounds=$(echo "$inbounds" | jq --argjson ib "$inbound" '. += [$ib]')
             ((success_count++))
         fi
+        done < <(echo "$proto_cfg" | jq -c 'if type == "array" then .[] else . end')
     done
     
     if [[ $success_count -eq 0 ]]; then
@@ -10277,6 +10394,17 @@ generate_singbox_config() {
             }')
     fi
 
+    # 如果任意 outbound 使用了 domain_resolver，自动注入 local-dns（Sing-box 1.12+ 规范）
+    if echo "$base_config" | jq -e 'any((.outbounds // [])[]; .domain_resolver != null)' >/dev/null 2>&1; then
+        base_config=$(echo "$base_config" | jq '
+            if (.dns.servers // [] | any(.tag == "local-dns")) then
+                .
+            else
+                .dns.servers = ((.dns.servers // []) + [{tag: "local-dns", type: "local"}])
+            end
+        ')
+    fi
+
     # 合并配置并写入文件
     echo "$base_config" | jq \
         --argjson ibs "$inbounds" \
@@ -10318,7 +10446,6 @@ create_singbox_service() {
 name="Sing-box Proxy Server"
 command="/usr/local/bin/sing-box"
 command_args="run -c $CFG/singbox.json"
-export ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS="true"
 command_background="yes"
 pidfile="/run/${service_name}.pid"
 depend() { need net; }
@@ -10337,12 +10464,11 @@ EOF
         prepare_managed_path "/etc/systemd/system/${service_name}.service" || return 1
         cat > /etc/systemd/system/${service_name}.service << EOF
 [Unit]
-Description=Sing-box Proxy Server (Hy2/TUIC/SS2022)
+Description=Sing-box Proxy Server (Hy2/TUIC/AnyTLS)
 After=network.target
 
 [Service]
 Type=simple
-Environment=ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true
 ${pre_cmd}
 ExecStart=$exec_cmd
 Restart=always
@@ -10432,17 +10558,7 @@ install_snell_v5() {
     rm -rf "$tmp"; _err "下载失败"; return 1
 }
 
-# 安装 AnyTLS
-install_anytls() {
-    local aarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
-    # Alpine 需要安装 gcompat 兼容层（以防 Go 二进制使用 CGO）
-    if [[ "$DISTRO" == "alpine" ]]; then
-        apk add --no-cache gcompat libc6-compat &>/dev/null
-    fi
-    _install_binary "anytls-server" "anytls/anytls-go" \
-        'https://github.com/anytls/anytls-go/releases/download/v$version/anytls_${version}_linux_${aarch}.zip' \
-        zip anytls-server stable false "" anytls-client
-}
+# AnyTLS 已统一由 Sing-box (>= 1.12.0) 核心托管，不再需要独立安装 anytls-server 二进制。
 
 # 安装 ShadowTLS
 install_shadowtls() {
@@ -10626,9 +10742,13 @@ gen_self_cert() {
     
     rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key"
     _info "生成自签名证书..."
-    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+    if ! openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
         -keyout "$CFG/certs/server.key" -out "$CFG/certs/server.crt" \
-        -subj "/CN=$domain" -days 36500 2>/dev/null
+        -subj "/CN=$domain" -addext "subjectAltName=DNS:$domain" -days 36500 2>/dev/null; then
+        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+            -keyout "$CFG/certs/server.key" -out "$CFG/certs/server.crt" \
+            -subj "/CN=$domain" -days 36500 2>/dev/null
+    fi
     chmod 600 "$CFG/certs/server.key"
 }
 
@@ -10938,17 +11058,53 @@ gen_tuic_server_config() {
     echo "server" > "$CFG/role"
 }
 
-# AnyTLS 服务端配置（迁移到 Sing-box 核心）
+# AnyTLS 服务端配置（Sing-box 核心 >= 1.12.0）
 gen_anytls_server_config() {
-    local password="$1" port="$2" sni="${3:-bing.com}"
+    local password="$1" port="$2" sni="${3:-www.bing.com}" cert_mode="${4:-}" padding_scheme_json="${5:-}"
     mkdir -p "$CFG"
 
-    # AnyTLS 在 Sing-box 中需要 TLS 配置；若当前没有证书则自动生成自签证书
-    [[ ! -f "$CFG/certs/server.crt" || ! -f "$CFG/certs/server.key" ]] && gen_self_cert "$sni"
+    # 智能判定证书模式：若未指定，自动检测是否命中 ACME 真证书
+    if [[ -z "$cert_mode" ]]; then
+        if _anytls_is_acme_trusted "$sni"; then
+            cert_mode="acme"
+            _ok "复用现有 ACME 证书 (域名: $sni)"
+        else
+            cert_mode="self"
+        fi
+    fi
 
-    register_protocol "anytls" "$(build_config password "$password" port "$port" sni "$sni")"
-    _save_join_info "anytls" "ANYTLS|%s|$port|$password|$sni" \
-        gen_anytls_link "%s" "$port" "$password" "$sni"
+    # 生成 AnyTLS 独立自签证书（包含 SAN），避免与全局 ACME 证书冲突
+    local anytls_cert_dir="$CFG/certs/anytls"
+    mkdir -p "$anytls_cert_dir"
+    local cert_file="$anytls_cert_dir/server.crt"
+    local key_file="$anytls_cert_dir/server.key"
+    local need_regen=false
+    [[ ! -f "$cert_file" || ! -f "$key_file" ]] && need_regen=true
+    if [[ "$need_regen" == "false" ]]; then
+        local cert_cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')
+        [[ "$cert_cn" != "$sni" ]] && need_regen=true
+    fi
+    if [[ "$need_regen" == "true" ]]; then
+        _info "为 AnyTLS 生成独立自签证书 (SNI: $sni)..."
+        if ! openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+            -keyout "$key_file" -out "$cert_file" \
+            -subj "/CN=$sni" -addext "subjectAltName=DNS:$sni" -days 36500 2>/dev/null; then
+            openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+                -keyout "$key_file" -out "$cert_file" \
+                -subj "/CN=$sni" -days 36500 2>/dev/null
+        fi
+        chmod 600 "$key_file"
+    fi
+
+    local cfg_json
+    cfg_json=$(build_config password "$password" port "$port" sni "$sni" cert_mode "$cert_mode")
+    if [[ -n "$padding_scheme_json" ]] && echo "$padding_scheme_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        cfg_json=$(echo "$cfg_json" | jq --argjson ps "$padding_scheme_json" '. + {padding_scheme: $ps}')
+    fi
+
+    register_protocol "anytls" "$cfg_json"
+    _save_join_info "anytls" "ANYTLS|%s|$port|$password|$sni|$cert_mode" \
+        gen_anytls_link "%s" "$port" "$password" "$sni" "" "$cert_mode"
     cp "$CFG/anytls.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
 }
@@ -11318,14 +11474,6 @@ create_service() {
     }
 
     case "$kind" in
-        anytls)
-            _need_cfg "anytls" "AnyTLS" || return 1
-            port=$(db_get_field "xray" "anytls" "port")
-            password=$(db_get_field "xray" "anytls" "password")
-            local lh=$(_listen_addr)
-            exec_cmd="/usr/local/bin/anytls-server -l $(_fmt_hostport "$lh" "$port") -p ${password}"
-            exec_name="anytls-server"
-            ;;
         naive)
             _need_cfg "naive" "NaïveProxy" || return 1
             exec_cmd="/usr/local/bin/caddy run --config $CFG/Caddyfile"
@@ -12133,7 +12281,7 @@ start_services() {
             failed_services+=("vless-reality")
     fi
     
-    # 2. 启动 Sing-box 服务（UDP/QUIC 协议: Hy2/TUIC）
+    # 2. 启动 Sing-box 服务（Hysteria2 / TUIC / AnyTLS）
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
         # 确保 Sing-box 已安装
@@ -15387,7 +15535,16 @@ configure_direct_outbound() {
     if [[ -n "$singbox_protocols" ]]; then
         _info "重新生成 Sing-box 配置..."
         svc stop vless-singbox 2>/dev/null
-        generate_singbox_config
+        if generate_singbox_config; then
+            local sb_bin
+            sb_bin=$(_core_binary_path singbox 2>/dev/null || command -v sing-box 2>/dev/null || true)
+            if [[ -n "$sb_bin" && -x "$sb_bin" ]] && ! "$sb_bin" check -c "$CFG/singbox.json" >/dev/null 2>&1; then
+                _err "Sing-box 配置检查失败，未能启动服务"
+                "$sb_bin" check -c "$CFG/singbox.json" 2>&1 | tail -n 10
+            else
+                svc start vless-singbox 2>/dev/null && _ok "Sing-box 服务已重启生效" || _err "Sing-box 服务启动失败"
+            fi
+        fi
     fi
 }
 
@@ -16387,6 +16544,9 @@ parse_proxy_link() {
                 --arg password "$password" --arg sni "$sni" --arg insecure "$insecure" \
                 '{name:$name,type:"hysteria2",server:$host,port:$port,password:$password,sni:$sni,insecure:$insecure}')
             ;;
+        anytls://*)
+            result=$(parse_anytls_link "$link" 2>/dev/null)
+            ;;
     esac
     
     [[ -n "$result" ]] && echo "$result" || return 1
@@ -16678,14 +16838,20 @@ gen_singbox_chain_outbound() {
     local server=$(echo "$node" | jq -r '.server')
     local port=$(echo "$node" | jq -r '.port')
     
-    # 根据 ip_mode 设置 Sing-box 的上游地址解析策略。
-    # as_is/ALL 不强制 IPv4/IPv6，避免 IPv6-only SOCKS5 节点被错误限制。
+    # 根据 ip_mode 设置 Sing-box 1.12+ 的上游地址解析策略（domain_resolver）。
+    # as_is/ALL 不强制 IPv4/IPv6，避免 IPv6-only 节点被错误限制。
     local domain_strategy=""
     case "$ip_mode" in
-        ipv6_only|prefer_ipv6)
+        ipv6_only)
+            domain_strategy="ipv6_only"
+            ;;
+        prefer_ipv6)
             domain_strategy="prefer_ipv6"
             ;;
-        ipv4_only|prefer_ipv4)
+        ipv4_only)
+            domain_strategy="ipv4_only"
+            ;;
+        prefer_ipv4)
             domain_strategy="prefer_ipv4"
             ;;
         as_is|asis|"")
@@ -16695,12 +16861,12 @@ gen_singbox_chain_outbound() {
             domain_strategy=""
             ;;
     esac
-    
+
+    local base=""
     case "$type" in
         socks)
             local username=$(echo "$node" | jq -r '.username // ""')
             local password=$(echo "$node" | jq -r '.password // ""')
-            local base=""
             if [[ -n "$username" || -n "$password" ]]; then
                 base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
                     --arg user "$username" --arg pass "$password" \
@@ -16709,38 +16875,33 @@ gen_singbox_chain_outbound() {
                 base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
                     '{tag:$tag,type:"socks",server:$server,server_port:$port}')
             fi
-            if [[ -n "$domain_strategy" && ! "$server" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$server" != *:* ]]; then
-                base=$(echo "$base" | jq --arg ds "$domain_strategy" '.domain_strategy = $ds')
-            fi
-            echo "$base"
             ;;
         http)
             local username=$(echo "$node" | jq -r '.username // ""')
             local password=$(echo "$node" | jq -r '.password // ""')
             if [[ -n "$username" && -n "$password" ]]; then
-                jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
-                    --arg user "$username" --arg pass "$password" --arg ds "$domain_strategy" \
-                    '{tag:$tag,type:"http",server:$server,server_port:$port,username:$user,password:$pass,domain_strategy:$ds}'
+                base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                    --arg user "$username" --arg pass "$password" \
+                    '{tag:$tag,type:"http",server:$server,server_port:$port,username:$user,password:$pass}')
             else
-                jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg ds "$domain_strategy" \
-                    '{tag:$tag,type:"http",server:$server,server_port:$port,domain_strategy:$ds}'
+                base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                    '{tag:$tag,type:"http",server:$server,server_port:$port}')
             fi
             ;;
         shadowsocks)
             local method=$(echo "$node" | jq -r '.method')
             local password=$(echo "$node" | jq -r '.password')
-            jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg method "$method" --arg password "$password" --arg ds "$domain_strategy" \
-                '{tag:$tag,type:"shadowsocks",server:$server,server_port:$port,method:$method,password:$password,domain_strategy:$ds}'
+            base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg method "$method" --arg password "$password" \
+                '{tag:$tag,type:"shadowsocks",server:$server,server_port:$port,method:$method,password:$password}')
             ;;
         vmess)
             local uuid=$(echo "$node" | jq -r '.uuid')
             local aid=$(echo "$node" | jq -r '.alterId // 0')
             local tls=$(echo "$node" | jq -r '.tls')
             
-            local base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --argjson aid "$aid" --arg ds "$domain_strategy" \
-                '{tag:$tag,type:"vmess",server:$server,server_port:$port,uuid:$uuid,alter_id:$aid,domain_strategy:$ds}')
+            base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --argjson aid "$aid" \
+                '{tag:$tag,type:"vmess",server:$server,server_port:$port,uuid:$uuid,alter_id:$aid}')
             [[ "$tls" == "tls" ]] && base=$(echo "$base" | jq --arg sni "$server" '.tls={enabled:true,server_name:$sni}')
-            echo "$base"
             ;;
         vless)
             local uuid=$(echo "$node" | jq -r '.uuid')
@@ -16754,8 +16915,8 @@ gen_singbox_chain_outbound() {
             local ws_path=$(echo "$node" | jq -r '.wsPath // "/"')
             local ws_host=$(echo "$node" | jq -r '.wsHost // ""')
             
-            local base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --arg ds "$domain_strategy" \
-                '{tag:$tag,type:"vless",server:$server,server_port:$port,uuid:$uuid,domain_strategy:$ds}')
+            base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" \
+                '{tag:$tag,type:"vless",server:$server,server_port:$port,uuid:$uuid}')
             
             # 添加 flow 字段（如 xtls-rprx-vision）
             if [[ -n "$flow" && "$flow" != "null" && "$flow" != "" ]]; then
@@ -16775,15 +16936,14 @@ gen_singbox_chain_outbound() {
             elif [[ "$security" == "tls" ]]; then
                 base=$(echo "$base" | jq --arg sni "$sni" '.tls={enabled:true,server_name:$sni}')
             fi
-            echo "$base"
             ;;
         trojan)
             local password=$(echo "$node" | jq -r '.password')
             local sni=$(echo "$node" | jq -r '.sni // ""')
             [[ -z "$sni" ]] && sni="$server"
             
-            jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg password "$password" --arg sni "$sni" --arg ds "$domain_strategy" \
-                '{tag:$tag,type:"trojan",server:$server,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni},domain_strategy:$ds}'
+            base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg password "$password" --arg sni "$sni" \
+                '{tag:$tag,type:"trojan",server:$server,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni}}')
             ;;
         hysteria2)
             local password=$(echo "$node" | jq -r '.password')
@@ -16791,21 +16951,40 @@ gen_singbox_chain_outbound() {
             local insecure=$(echo "$node" | jq -r '.insecure // "0"')
             [[ -z "$sni" ]] && sni="$server"
             
-            local base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg password "$password" --arg sni "$sni" --arg ds "$domain_strategy" \
-                '{tag:$tag,type:"hysteria2",server:$server,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni},domain_strategy:$ds}')
+            base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg password "$password" --arg sni "$sni" \
+                '{tag:$tag,type:"hysteria2",server:$server,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni}}')
             [[ "$insecure" == "1" ]] && base=$(echo "$base" | jq '.tls.insecure=true')
-            echo "$base"
             ;;
         naive)
             # NaiveProxy (HTTP/2 代理)
             local username=$(echo "$node" | jq -r '.username')
             local password=$(echo "$node" | jq -r '.password')
             
-            jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
-                --arg user "$username" --arg pass "$password" --arg ds "$domain_strategy" \
-                '{tag:$tag,type:"naive",server:$server,server_port:$port,username:$user,password:$pass,tls:{enabled:true,server_name:$server},domain_strategy:$ds}'
+            base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                --arg user "$username" --arg pass "$password" \
+                '{tag:$tag,type:"naive",server:$server,server_port:$port,username:$user,password:$pass,tls:{enabled:true,server_name:$server}}')
+            ;;
+        anytls)
+            local password=$(echo "$node" | jq -r '.password')
+            local sni=$(echo "$node" | jq -r '.sni // ""')
+            local insecure=$(echo "$node" | jq -r '.insecure // "0"')
+            local fp=$(echo "$node" | jq -r '.fp // "chrome"')
+            [[ -z "$sni" ]] && sni="$server"
+            [[ -z "$fp" || "$fp" == "null" ]] && fp="chrome"
+
+            base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                --arg password "$password" --arg sni "$sni" --arg fp "$fp" \
+                '{tag:$tag,type:"anytls",server:$server,server_port:$port,password:$password,idle_session_check_interval:"30s",idle_session_timeout:"30s",min_idle_session:5,tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:$fp}}}')
+            [[ "$insecure" == "1" || "$insecure" == "true" ]] && base=$(echo "$base" | jq '.tls.insecure=true')
             ;;
     esac
+
+    if [[ -n "$base" ]]; then
+        if [[ -n "$domain_strategy" && ! "$server" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$server" != *:* ]]; then
+            base=$(echo "$base" | jq --arg ds "$domain_strategy" '.domain_resolver = {server: "local-dns", strategy: $ds}')
+        fi
+        echo "$base"
+    fi
 }
 
 # 添加节点交互 (带解析预览和自定义名称)
@@ -16813,7 +16992,7 @@ _add_chain_node_interactive() {
     _header
     echo -e "  ${W}添加代理节点${NC}"
     _line
-    echo -e "  ${D}支持: ss/vmess/vless/trojan/hysteria2/socks5/naive${NC}"
+    echo -e "  ${D}支持: ss/vmess/vless/trojan/hysteria2/anytls/socks5/naive${NC}"
     echo ""
     
     echo -e "  ${Y}粘贴代理链接:${NC}"
@@ -18496,7 +18675,10 @@ show_all_share_links() {
                     snell) link=$(gen_snell_link "$ipv4" "$display_port" "$psk" "$version" "$country_code") ;;
                     snell-v5) link=$(gen_snell_v5_link "$ipv4" "$display_port" "$psk" "$version" "$country_code") ;;
                     tuic) link=$(gen_tuic_link "$ipv4" "$display_port" "$uuid" "$password" "$sni" "$country_code") ;;
-                    anytls) link=$(gen_anytls_link "$ipv4" "$display_port" "$password" "$sni" "$country_code") ;;
+                    anytls)
+                        local anytls_cert_mode=$(echo "$cfg" | jq -r '.cert_mode // empty')
+                        link=$(gen_anytls_link "$ipv4" "$display_port" "$password" "$sni" "$country_code" "$anytls_cert_mode")
+                        ;;
                     naive) link=$(gen_naive_link "$domain" "$display_port" "$username" "$password" "$country_code") ;;
                     socks) link=$(gen_socks_link "$ipv4" "$display_port" "$username" "$password" "$country_code") ;;
                     # ShadowTLS 组合协议：没有标准分享链接，显示 Surge/Loon 配置
@@ -18547,7 +18729,10 @@ show_all_share_links() {
                     snell) link=$(gen_snell_link "$ip6" "$display_port" "$psk" "$version" "$country_code") ;;
                     snell-v5) link=$(gen_snell_v5_link "$ip6" "$display_port" "$psk" "$version" "$country_code") ;;
                     tuic) link=$(gen_tuic_link "$ip6" "$display_port" "$uuid" "$password" "$sni" "$country_code") ;;
-                    anytls) link=$(gen_anytls_link "$ip6" "$display_port" "$password" "$sni" "$country_code") ;;
+                    anytls)
+                        local anytls_cert_mode=$(echo "$cfg" | jq -r '.cert_mode // empty')
+                        link=$(gen_anytls_link "$ip6" "$display_port" "$password" "$sni" "$country_code" "$anytls_cert_mode")
+                        ;;
                     naive) ;; # NaïveProxy 使用域名，不需要 IPv6 链接
                     socks) link=$(gen_socks_link "$ip6" "$display_port" "$username" "$password" "$country_code") ;;
                     # ShadowTLS 组合协议 IPv6：没有标准分享链接，显示 Surge/Loon 配置
@@ -18898,11 +19083,45 @@ show_single_protocol_info() {
             echo -e "  ${C}${country_code}-Trojan-WS = trojan, ${config_ip}, ${display_port}, \"${password}\", transport=ws, path=${path}, host=${sni}, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=true${NC}"
             ;;
         anytls)
+            local anytls_cert_mode=$(echo "$cfg" | jq -r '.cert_mode // empty')
+            local anytls_skip_verify="true"
+            local anytls_cert_label="自签证书"
+            if [[ "$anytls_cert_mode" == "acme" ]] || _anytls_is_acme_trusted "$sni" "$anytls_cert_mode"; then
+                anytls_skip_verify="false"
+                anytls_cert_label="ACME 受信任证书"
+            fi
+            local anytls_ps_count=$(echo "$cfg" | jq -r '(.padding_scheme // []) | length' 2>/dev/null)
             echo -e "  密码: ${G}$password${NC}"
             echo -e "  SNI: ${G}$sni${NC}"
+            echo -e "  证书模式: ${G}$anytls_cert_label${NC}"
+            if [[ "${anytls_ps_count:-0}" -gt 0 ]]; then
+                echo -e "  填充策略: ${G}已配置 (${anytls_ps_count} 条规则)${NC}"
+            else
+                echo -e "  填充策略: ${G}Sing-box / anytls-go 默认策略${NC}"
+            fi
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-AnyTLS = anytls, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-AnyTLS = anytls, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=${anytls_skip_verify}${NC}"
+            echo ""
+            echo -e "  ${Y}Sing-box 客户端 Outbound (v1.12.0+):${NC}"
+            local sb_out
+            sb_out=$(jq -n --arg server "$config_ip" --argjson port "$display_port" --arg pw "$password" --arg sni "$sni" --argjson insecure "$anytls_skip_verify" '{
+                type: "anytls",
+                tag: "anytls-out",
+                server: $server,
+                server_port: $port,
+                password: $pw,
+                idle_session_check_interval: "30s",
+                idle_session_timeout: "30s",
+                min_idle_session: 5,
+                tls: {
+                    enabled: true,
+                    server_name: $sni,
+                    insecure: $insecure,
+                    utls: {enabled: true, fingerprint: "chrome"}
+                }
+            }')
+            echo "$sb_out" | sed 's/^/  /'
             ;;
         naive)
             local domain=$(echo "$cfg" | jq -r '.domain // empty')
@@ -19095,8 +19314,9 @@ show_single_protocol_info() {
                 join_code=$(echo "TUIC|${ip_addr}|${link_port}|${uuid}|${password}|${sni}" | base64 -w 0)
                 ;;
             anytls)
-                link=$(gen_anytls_link "$ip_addr" "$link_port" "$password" "$sni" "$country_code")
-                join_code=$(echo "ANYTLS|${ip_addr}|${link_port}|${password}|${sni}" | base64 -w 0)
+                local anytls_cert_mode=$(echo "$cfg" | jq -r '.cert_mode // empty')
+                link=$(gen_anytls_link "$ip_addr" "$link_port" "$password" "$sni" "$country_code" "$anytls_cert_mode")
+                join_code=$(echo "ANYTLS|${ip_addr}|${link_port}|${password}|${sni}|${anytls_cert_mode}" | base64 -w 0)
                 ;;
             naive)
                 local domain=$(echo "$cfg" | jq -r '.domain // empty')
@@ -19891,7 +20111,7 @@ do_uninstall() {
     echo ""
     echo -e "  ${Y}已保留的内容:${NC}"
     echo -e "  • 软件包: xray, sing-box, snell-server"
-    echo -e "  • 软件包: anytls-server, shadow-tls, caddy"
+    echo -e "  • 软件包: shadow-tls, caddy"
     echo -e "  • ${G}域名证书: 下次安装将自动复用，无需重新申请${NC}"
     echo ""
     echo -e "  ${C}如需删除证书，请执行:${NC}"
@@ -20181,8 +20401,12 @@ do_install_server() {
         vless|vless-xhttp|vless-ws|vless-ws-notls|vmess-ws|vless-vision|ss2022|ss-legacy|trojan|socks)
             install_xray || { _err "Xray 安装失败"; _pause; return 1; }
             ;;
-        hy2|tuic|anytls)
+        hy2|tuic)
             install_singbox || { _err "Sing-box 安装失败"; _pause; return 1; }
+            ;;
+        anytls)
+            install_singbox || { _err "Sing-box 安装失败"; _pause; return 1; }
+            ensure_singbox_anytls_version true || { _err "Sing-box 版本不满足 AnyTLS 要求 (>= ${SINGBOX_ANYTLS_MIN_VERSION})"; _pause; return 1; }
             ;;
         snell)
             install_snell || { _err "Snell 安装失败"; _pause; return 1; }
@@ -20201,9 +20425,6 @@ do_install_server() {
         ss2022-shadowtls)
             install_xray || { _err "Xray 安装失败"; _pause; return 1; }
             install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
-            ;;
-        anytls)
-            install_anytls || { _err "AnyTLS 安装失败"; _pause; return 1; }
             ;;
         naive)
             install_naive || { _err "NaïveProxy 安装失败"; _pause; return 1; }
@@ -21182,24 +21403,80 @@ do_install_server() {
             ;;
         anytls)
             local password=$(ask_password 16 "AnyTLS密码")
-            
-            # AnyTLS不需要证书申请，直接询问SNI配置
-            local final_sni=$(ask_sni_config "$(gen_sni)" "")
-            
+            local cert_domain=$(ask_cert_config "$(gen_sni)")
+            local final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
+            local cert_mode="self"
+            if [[ -n "$cert_domain" ]] && _anytls_is_acme_trusted "$final_sni" "acme"; then
+                cert_mode="acme"
+            fi
+
+            # Padding Scheme 配置（对齐 anytls/anytls-go 抗 TLS-in-TLS 特征策略）
+            local padding_scheme_json=""
+            local padding_desc="Sing-box / anytls-go 官方默认策略"
             echo ""
             _line
-            echo -e "  ${C}AnyTLS 配置${NC}"
+            echo -e "  ${W}AnyTLS Padding Scheme (流量填充策略)${NC}"
             _line
-            echo -e "  端口: ${G}$port${NC}"
+            echo -e "  ${D}服务端会通过 cmdUpdatePaddingScheme 下发策略给客户端，用于消除 TLS-in-TLS 特征。${NC}"
+            echo -e "  ${G}1${NC}) 官方默认策略 (推荐)"
+            echo -e "  ${G}2${NC}) 随机微调策略 (降低与默认特征重合)"
+            echo -e "  ${G}3${NC}) 自定义策略 (按 anytls-go 语法，分号分隔)"
+            echo ""
+            read -rp "  请选择 [1-3, 回车默认 1]: " ps_choice
+            case "$ps_choice" in
+                2)
+                    local p0=$((24 + RANDOM % 17))
+                    local p1_min=$((80 + RANDOM % 61))
+                    local p1_max=$((320 + RANDOM % 141))
+                    local p2_min=$((350 + RANDOM % 101))
+                    local p2_max=$((480 + RANDOM % 121))
+                    local p_hi_min=$((450 + RANDOM % 121))
+                    local p_hi_max=$((850 + RANDOM % 251))
+                    padding_scheme_json=$(jq -nc \
+                        --arg s0 "stop=8" \
+                        --arg s1 "0=${p0}-${p0}" \
+                        --arg s2 "1=${p1_min}-${p1_max}" \
+                        --arg s3 "2=${p2_min}-${p2_max},c,${p_hi_min}-${p_hi_max},c,${p_hi_min}-${p_hi_max},c,${p_hi_min}-${p_hi_max},c,${p_hi_min}-${p_hi_max}" \
+                        --arg s4 "3=9-9,${p_hi_min}-${p_hi_max}" \
+                        --arg s5 "4=${p_hi_min}-${p_hi_max}" \
+                        --arg s6 "5=${p_hi_min}-${p_hi_max}" \
+                        --arg s7 "6=${p_hi_min}-${p_hi_max}" \
+                        --arg s8 "7=${p_hi_min}-${p_hi_max}" \
+                        '[$s0,$s1,$s2,$s3,$s4,$s5,$s6,$s7,$s8]')
+                    padding_desc="随机微调策略 (9 条规则)"
+                    ;;
+                3)
+                    echo -e "  ${D}示例: stop=8;0=30-30;1=100-400;2=400-500,c,500-1000;3=9-9,500-1000${NC}"
+                    read -rp "  请输入策略 (分号分隔，留空使用默认): " custom_ps
+                    if [[ -n "$custom_ps" ]]; then
+                        padding_scheme_json=$(printf '%s' "$custom_ps" | tr ';' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | jq -R . | jq -sc '.')
+                        if echo "$padding_scheme_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+                            local ps_cnt=$(echo "$padding_scheme_json" | jq 'length')
+                            padding_desc="自定义策略 (${ps_cnt} 条规则)"
+                        else
+                            _warn "策略格式无效，已回退为官方默认策略"
+                            padding_scheme_json=""
+                        fi
+                    fi
+                    ;;
+            esac
+
+            echo ""
+            _line
+            echo -e "  ${C}AnyTLS 配置 (Sing-box >= ${SINGBOX_ANYTLS_MIN_VERSION})${NC}"
+            _line
+            echo -e "  端口: ${G}$port${NC} (TCP/TLS)"
             echo -e "  密码: ${G}$password${NC}"
             echo -e "  SNI: ${G}$final_sni${NC}"
+            echo -e "  证书: ${G}$([[ "$cert_mode" == "acme" ]] && echo "ACME 受信任证书 (insecure=0)" || echo "独立自签证书 (insecure=1)")${NC}"
+            echo -e "  填充: ${G}$padding_desc${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
             [[ "$confirm" =~ ^[nN]$ ]] && return
             
             _info "生成配置..."
-            gen_anytls_server_config "$password" "$port" "$final_sni"
+            gen_anytls_server_config "$password" "$port" "$final_sni" "$cert_mode" "$padding_scheme_json"
             ;;
         naive)
             local username=$(ask_password 8 "NaïveProxy用户名")
@@ -21882,42 +22159,84 @@ parse_hy2_link() {
         '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni}'
 }
 
-# 解析 anytls:// 链接
+# 解析 anytls:// 链接（遵循 anytls/anytls-go uri_scheme.md）
 parse_anytls_link() {
     local link="$1"
-    # anytls://password@server:port?sni=xxx#name
+    # anytls://password@server[:port][/?params][#name]
     local content="${link#anytls://}"
-    local name="${content##*#}"
-    name=$(printf '%b' "${name//%/\\x}")
-    content="${content%%#*}"
-    
-    local password="${content%%@*}"
-    content="${content#*@}"
-    
-    local server_port="${content%%\?*}"
-    # 解析 host:port（支持 IPv6）
-    local parsed=$(_parse_hostport "$server_port")
-    local server="${parsed%%|*}"
-    local port="${parsed##*|}"
-    
-    local params="${content#*\?}"
-    local sni=""
-    IFS='&' read -ra PARAMS <<< "$params"
-    for param in "${PARAMS[@]}"; do
-        local key="${param%%=*}"
-        local value="${param#*=}"
-        case "$key" in
-            sni) sni="$value" ;;
-        esac
-    done
-    
+    local name=""
+    if [[ "$content" == *"#"* ]]; then
+        name=$(urldecode "${content##*#}")
+        content="${content%%#*}"
+    fi
+
+    local params=""
+    if [[ "$content" == *"?"* ]]; then
+        params="${content#*\?}"
+        content="${content%%\?*}"
+    fi
+
+    local password=""
+    local server_port="$content"
+    if [[ "$content" == *"@"* ]]; then
+        password=$(urldecode "${content%@*}")
+        server_port="${content##*@}"
+    fi
+    # 去除可选路径（如 /）
+    server_port="${server_port%%/*}"
+
+    # 解析 host:port（支持 IPv6；省略端口时默认 443）
+    local server="" port="443"
+    if [[ "$server_port" == \[*\]* ]]; then
+        if [[ "$server_port" == *\]:* ]]; then
+            local parsed=$(_parse_hostport "$server_port")
+            server="${parsed%%|*}"
+            port="${parsed##*|}"
+        else
+            server="${server_port#[}"
+            server="${server%]}"
+            port="443"
+        fi
+    elif [[ "$server_port" == *:* ]]; then
+        local parsed=$(_parse_hostport "$server_port")
+        server="${parsed%%|*}"
+        port="${parsed##*|}"
+    else
+        server="$server_port"
+        port="443"
+    fi
+
+    local sni="" insecure="0" fp="" alpn="" hpkp=""
+    if [[ -n "$params" ]]; then
+        IFS='&' read -ra PARAMS <<< "$params"
+        for param in "${PARAMS[@]}"; do
+            local key="${param%%=*}"
+            local value=$(urldecode "${param#*=}")
+            case "$key" in
+                sni) sni="$value" ;;
+                insecure|allowInsecure)
+                    if [[ "$value" == "1" || "$value" == "true" ]]; then
+                        insecure="1"
+                    else
+                        insecure="0"
+                    fi
+                    ;;
+                fp|client-fingerprint) fp="$value" ;;
+                alpn) alpn="$value" ;;
+                hpkp) hpkp="$value" ;;
+            esac
+        done
+    fi
+
+    [[ -z "$name" ]] && name="AnyTLS-${server}"
+
     # 确保 port 是数字
     port=$(echo "$port" | tr -d '"' | tr -d ' ')
     if [[ ! "$port" =~ ^[0-9]+$ ]]; then
         echo "错误: 无法解析端口号 '$port'" >&2
         return 1
     fi
-    
+
     # 使用 jq 生成 JSON
     jq -nc \
         --arg type "anytls" \
@@ -21926,7 +22245,11 @@ parse_anytls_link() {
         --argjson port "$port" \
         --arg password "$password" \
         --arg sni "$sni" \
-        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni}'
+        --arg insecure "$insecure" \
+        --arg fp "$fp" \
+        --arg alpn "$alpn" \
+        --arg hpkp "$hpkp" \
+        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni,insecure:$insecure,fp:$fp,alpn:$alpn,hpkp:$hpkp}'
 }
 
 # 解析任意分享链接
@@ -22340,15 +22663,22 @@ EOF
             ;;
         anytls)
             local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local sni=$(echo "$json" | jq -r '.sni // ""')
+            local insecure=$(echo "$json" | jq -r '.insecure // "1"')
+            local fp=$(echo "$json" | jq -r '.fp // "chrome"')
+            [[ -z "$fp" || "$fp" == "null" ]] && fp="chrome"
+            local skip_verify="true"
+            [[ "$insecure" == "0" || "$insecure" == "false" ]] && skip_verify="false"
             cat << EOF
   - name: "$name"
     type: anytls
     server: "$server"
     port: $port
-    password: $password
+    password: "$password"
+    client-fingerprint: $fp
+    udp: true
     sni: $sni
-    skip-cert-verify: true
+    skip-cert-verify: $skip_verify
 EOF
             ;;
     esac
@@ -22399,8 +22729,11 @@ external_link_to_surge() {
             ;;
         anytls)
             local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
-            echo "$name = anytls, $server, $port, password=$password, sni=$sni, skip-cert-verify=true"
+            local sni=$(echo "$json" | jq -r '.sni // ""')
+            local insecure=$(echo "$json" | jq -r '.insecure // "1"')
+            local skip_verify="true"
+            [[ "$insecure" == "0" || "$insecure" == "false" ]] && skip_verify="false"
+            echo "$name = anytls, $server, $port, password=$password, sni=$sni, skip-cert-verify=$skip_verify"
             ;;
     esac
 }
@@ -22834,7 +23167,8 @@ gen_v2ray_sub() {
                     [[ -n "$server_ip" ]] && link=$(gen_tuic_link "$server_ip" "$actual_port" "$uuid" "$password" "$sni" "$country_code")
                     ;;
                 anytls)
-                    [[ -n "$server_ip" ]] && link=$(gen_anytls_link "$server_ip" "$actual_port" "$password" "$sni" "$country_code")
+                    local anytls_cert_mode=$(echo "$cfg" | jq -r '.cert_mode // empty')
+                    [[ -n "$server_ip" ]] && link=$(gen_anytls_link "$server_ip" "$actual_port" "$password" "$sni" "$country_code" "$anytls_cert_mode")
                     ;;
                 snell)
                     [[ -n "$server_ip" ]] && link=$(gen_snell_link "$server_ip" "$actual_port" "$psk" "4" "$country_code")
@@ -23057,13 +23391,20 @@ EOF
     skip-cert-verify: true"
                 ;;
             anytls)
+                local anytls_cert_mode=$(echo "$cfg" | jq -r '.cert_mode // empty')
+                local anytls_skip_verify="true"
+                if [[ "$anytls_cert_mode" == "acme" ]] || _anytls_is_acme_trusted "$sni" "$anytls_cert_mode"; then
+                    anytls_skip_verify="false"
+                fi
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
     type: anytls
     server: \"$server_ip\"
     port: $port
-    password: $password
+    password: \"$password\"
+    client-fingerprint: chrome
+    udp: true
     sni: $sni
-    skip-cert-verify: true"
+    skip-cert-verify: $anytls_skip_verify"
                 ;;
             esac
             
@@ -23179,7 +23520,12 @@ gen_surge_sub() {
                     [[ -n "$server_ip" ]] && proxy="$name = tuic, $server_ip, $port, uuid=$uuid, password=$password, sni=$sni, skip-cert-verify=true, alpn=h3"
                     ;;
                 anytls)
-                    [[ -n "$server_ip" ]] && proxy="$name = anytls, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
+                    local anytls_cert_mode=$(echo "$cfg" | jq -r '.cert_mode // empty')
+                    local anytls_skip_verify="true"
+                    if [[ "$anytls_cert_mode" == "acme" ]] || _anytls_is_acme_trusted "$sni" "$anytls_cert_mode"; then
+                        anytls_skip_verify="false"
+                    fi
+                    [[ -n "$server_ip" ]] && proxy="$name = anytls, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=$anytls_skip_verify"
                     ;;
                 snell|snell-v5|snell-shadowtls|snell-v5-shadowtls)
                     # Snell 和 Snell+ShadowTLS 都使用相同的 Surge 配置格式
@@ -25224,12 +25570,12 @@ show_service_logs() {
     # Sing-box 协议组 (hy2/tuic)
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        echo -e "  ${G}$idx${NC}) Sing-box 服务日志 (hy2/tuic)"
+        echo -e "  ${G}$idx${NC}) Sing-box 服务日志 (hy2/tuic/anytls)"
         proto_array+=("singbox")
         ((idx++))
     fi
     
-    # 独立进程协议 (Snell/AnyTLS/ShadowTLS)
+    # 独立进程协议 (Snell/ShadowTLS/NaïveProxy)
     local standalone_protocols=$(get_standalone_protocols)
     for proto in $standalone_protocols; do
         local proto_name=$(get_protocol_name $proto)
@@ -25276,10 +25622,6 @@ show_service_logs() {
         snell-shadowtls|snell-v5-shadowtls|ss2022-shadowtls)
             service_name="vless-${selected}"
             proc_name="shadow-tls"
-            ;;
-        anytls)
-            service_name="vless-anytls"
-            proc_name="anytls-server"
             ;;
     esac
     
@@ -27930,7 +28272,7 @@ self_check() {
         fi
     fi
 
-    for cmd in xray sing-box snell-server snell-server-v5 anytls-server shadow-tls cloudflared realm; do
+    for cmd in xray sing-box snell-server snell-server-v5 shadow-tls cloudflared realm; do
         if command -v "$cmd" >/dev/null 2>&1; then
             echo "[INFO] 已安装: $cmd"
         fi
