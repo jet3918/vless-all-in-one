@@ -4647,10 +4647,21 @@ _pause() { echo "" >&2; read -rp "  按回车继续..."; }
 
 # URL 解码函数 (处理 %XX 编码的中文等字符)
 urldecode() {
-    local encoded="$1"
-    # 先转义字面反斜杠，再用 printf 解码 %XX 格式，避免 \n/\\ 被误转义
-    encoded="${encoded//\\/\\\\}"
-    printf '%b' "${encoded//%/\\x}"
+    local encoded="$1" out="" i=0
+    local len=${#encoded}
+    # 仅解码合法的 %XX 十六进制转义，保留字面反斜杠和裸 %（如 100%）
+    while (( i < len )); do
+        if [[ "${encoded:i:1}" == "%" && $((i + 2)) -lt len && "${encoded:i+1:2}" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+            local byte
+            printf -v byte '%b' "\\x${encoded:i+1:2}"
+            out+="$byte"
+            ((i += 3))
+        else
+            out+="${encoded:i:1}"
+            ((++i))
+        fi
+    done
+    printf '%s' "$out"
 }
 
 # 解析 URL 查询参数 (key=value&...)
@@ -5697,41 +5708,13 @@ server {
         try_files \$uri \$uri/ =404;
     }
     
-    # 订阅文件目录 - v2ray 映射到 base64
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-    
-    # 订阅文件目录 - clash
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-    
-    # 订阅文件目录 - surge
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-    
-    # 订阅文件目录 - 通用
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
-    }
-    
     server_tokens off;
 }
 EOF
         elif [[ "$is_real_domain" == "true" ]]; then
-            # Reality真实域名模式：
-            # - 127.0.0.1:nginx_port 供 Reality dest 回落（只显示伪装网页，无订阅）
-            # - 0.0.0.0:nginx_port 供外部直接访问（伪装网页 + 订阅服务）
+            # Reality真实域名模式：127.0.0.1:nginx_port 供 Reality dest 回落显示伪装网页
             cat > "$nginx_conf_file" << EOF
-# Reality 回落后端 (真实域名模式) - 只显示伪装网页
+# Reality 回落后端 (真实域名模式) - 伪装网页
 server {
     listen 127.0.0.1:$nginx_port ssl http2;
     server_name $domain;
@@ -5748,63 +5731,11 @@ server {
         try_files \$uri \$uri/ =404;
     }
     
-    # 订阅路径返回404，防止通过Reality端口访问订阅
-    location /sub/ {
-        return 404;
-    }
-    
-    server_tokens off;
-}
-
-# 订阅服务 (外部直接访问) - 伪装网页 + 订阅
-server {
-    listen $nginx_port ssl http2;
-    listen [::]:$nginx_port ssl http2;
-    server_name $domain;
-    
-    ssl_certificate $CFG/certs/server.crt;
-    ssl_certificate_key $CFG/certs/server.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    
-    root $web_dir;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # 订阅文件目录 - v2ray 映射到 base64
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-    
-    # 订阅文件目录 - clash
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-    
-    # 订阅文件目录 - surge
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-    
-    # 订阅文件目录 - 通用
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
-    }
-    
     server_tokens off;
 }
 EOF
         else
-            # Reality无域名模式：单端口 HTTP 配置
+            # Reality无域名模式：单端口 HTTP 伪装站配置
             cat > "$nginx_conf_file" << EOF
 server {
     listen $nginx_listen;  # $nginx_comment
@@ -5815,32 +5746,6 @@ server {
     
     location / {
         try_files \$uri \$uri/ =404;
-    }
-    
-    # 订阅文件目录 - v2ray 映射到 base64
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-    
-    # 订阅文件目录 - clash
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-    
-    # 订阅文件目录 - surge
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-    
-    # 订阅文件目录 - 通用
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
     }
     
     server_tokens off;
@@ -5888,7 +5793,7 @@ EOF
             
             if [[ "$nginx_running" == "true" && "$port_listening" == "true" ]]; then
                 _ok "伪装网页已创建并启动"
-                _ok "Web服务器运行正常，订阅链接可用"
+                _ok "Web服务器运行正常"
                 # Reality 真实域名模式时，显示 Reality 端口
                 if [[ "$is_real_domain" == "true" ]]; then
                     local reality_port=$(db_get_field "xray" "vless" "port")
@@ -5917,21 +5822,7 @@ EOF
             remove_managed_path /etc/nginx/sites-enabled/vless-fake
         fi
         
-        # 保存订阅配置信息
-        local sub_uuid=$(get_sub_uuid)
-        local use_https="false"
-        # TLS协议 或 Reality真实域名模式 用 HTTPS
-        if [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]] || [[ "$is_real_domain" == "true" ]]; then
-            use_https="true"
-        fi
-        
-        cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$nginx_port
-sub_domain=$domain
-sub_https=$use_https
-EOF
-        _log "INFO" "订阅配置已保存: UUID=${sub_uuid:0:8}..., 端口=$nginx_port, 域名=$domain"
+        _log "INFO" "伪装网页配置已保存: 端口=$nginx_port, 域名=$domain"
     fi
     
 }
@@ -6191,14 +6082,18 @@ _anytls_is_ip() {
 
 _anytls_is_acme_trusted() {
     local sni="$1" cert_mode="${2:-}"
+    # cert_mode 为 self 时尊重用户显式选择，不擅自切去全局 ACME 证书
     [[ "$cert_mode" == "self" ]] && return 1
     if [[ -f "$CFG/cert_domain" && -s "$CFG/certs/server.crt" && -s "$CFG/certs/server.key" && -n "$sni" ]]; then
         local cert_domain
         cert_domain=$(cat "$CFG/cert_domain" 2>/dev/null)
         if [[ "$sni" == "$cert_domain" ]]; then
-            local issuer
+            local issuer subject
             issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null || true)
-            if [[ "$issuer" =~ (Let\'s\ Encrypt|R3|R10|R11|E1|E5|E6|ZeroSSL|Buypass|DigiCert|Comodo|GlobalSign|Google\ Trust) ]]; then
+            subject=$(openssl x509 -in "$CFG/certs/server.crt" -noout -subject 2>/dev/null || true)
+            # 排除自签证书（issuer 与 subject 相同），并匹配可信 CA 组织名
+            if [[ -n "$issuer" && "${issuer#issuer=}" != "${subject#subject=}" ]] && \
+               [[ "$issuer" =~ O[[:space:]]*=[[:space:]]*(Let\'s\ Encrypt|ZeroSSL|Google\ Trust\ Services|DigiCert|Sectigo|Comodo|GlobalSign|Buypass) ]]; then
                 # 校验真实证书尚未过期
                 if openssl x509 -in "$CFG/certs/server.crt" -noout -checkend 0 >/dev/null 2>&1; then
                     return 0
@@ -6994,19 +6889,6 @@ setup_cert_and_nginx() {
                     REALITY_SNI_CONFIRMED="$CERT_DOMAIN"
                 fi
                 
-                # 读取已有的订阅配置
-                if [[ -f "$CFG/sub.info" ]]; then
-                    source "$CFG/sub.info" 2>/dev/null
-                    NGINX_PORT="${sub_port:-$default_nginx_port}"
-                    
-                    # Reality 协议使用真实域名时，必须用 HTTPS 端口，不能用 80
-                    if [[ "$protocol" == "vless" || "$protocol" == "vless-xhttp" ]]; then
-                        if [[ "$NGINX_PORT" == "80" ]]; then
-                            NGINX_PORT="$default_nginx_port"
-                        fi
-                    fi
-                fi
-                
                 _ok "使用证书域名: $CERT_DOMAIN"
                 
                 # 检查 Nginx 配置文件是否存在 (包括 Alpine http.d)
@@ -7015,43 +6897,11 @@ setup_cert_and_nginx() {
                     nginx_conf_exists=true
                 fi
                 
-                # 检查订阅文件是否存在
-                local sub_uuid=$(get_sub_uuid)  # 使用统一的函数获取或生成 UUID
-                local sub_files_exist=false
-                if [[ -f "$CFG/subscription/$sub_uuid/base64" ]]; then
-                    sub_files_exist=true
-                fi
-                
-                # 如果 Nginx 配置或订阅文件不存在，重新配置
-                if [[ "$nginx_conf_exists" == "false" ]] || [[ "$sub_files_exist" == "false" ]]; then
-                    _info "配置订阅服务 (端口: $NGINX_PORT)..."
-                    generate_sub_files
+                # 如果 Nginx 伪装站配置不存在，重新配置
+                if [[ "$nginx_conf_exists" == "false" ]]; then
+                    _info "配置伪装网页服务 (端口: $NGINX_PORT)..."
                     create_fake_website "$CERT_DOMAIN" "$protocol" "$NGINX_PORT"
                 else
-                    # 检查 Nginx 配置是否有正确的订阅路由 (使用 alias 指向 subscription 目录)
-                    local nginx_conf_valid=false
-                    if grep -q "alias.*subscription" "/etc/nginx/http.d/vless-fake.conf" 2>/dev/null; then
-                        nginx_conf_valid=true
-                    elif grep -q "alias.*subscription" "/etc/nginx/conf.d/vless-fake.conf" 2>/dev/null; then
-                        nginx_conf_valid=true
-                    elif grep -q "alias.*subscription" "/etc/nginx/sites-available/vless-fake" 2>/dev/null; then
-                        nginx_conf_valid=true
-                    fi
-                    
-                    if [[ "$nginx_conf_valid" == "false" ]]; then
-                        _warn "检测到旧版 Nginx 配置，正在更新..."
-                        generate_sub_files
-                        create_fake_website "$CERT_DOMAIN" "$protocol" "$NGINX_PORT"
-                    fi
-                    
-                    # Reality 协议不显示 Nginx 端口（外部访问走 Reality 端口）
-                    if [[ "$protocol" != "vless" && "$protocol" != "vless-xhttp" ]]; then
-                        _ok "订阅服务端口: $NGINX_PORT"
-                    fi
-                    
-                    # 确保订阅文件是最新的
-                    generate_sub_files
-                    
                     # 确保 Nginx 运行
                     if ! ss -tlnp 2>/dev/null | grep -qE ":${NGINX_PORT}\s|:${NGINX_PORT}$"; then
                         _info "启动 Nginx 服务..."
@@ -8290,26 +8140,34 @@ _xray_binary_version() {
     printf '%s\n' "$version"
 }
 
-# 订阅应跟随脚本服务实际使用的核心，探测不到版本时保留缺省。
+# 订阅应跟随脚本服务实际使用的核心，探测不到版本时保留缺省并记日志。
 _local_reality_mlkem() {
     local bin="$XRAY_BINARY" version
     if [[ ! -x "$bin" ]]; then
         bin=$(command -v xray 2>/dev/null || true)
     fi
-    [[ -n "$bin" && -x "$bin" ]] || return 0
-    version=$(_xray_binary_version "$bin") || return 0
+    if [[ -z "$bin" || ! -x "$bin" ]]; then
+        _log "WARN" "_local_reality_mlkem: 未找到可执行 xray 二进制，跳过 support-x25519mlkem768"
+        return 0
+    fi
+    if ! version=$(_xray_binary_version "$bin"); then
+        _log "WARN" "_local_reality_mlkem: 无法解析 Xray 版本 ($bin)，跳过 support-x25519mlkem768"
+        return 0
+    fi
     if ! _version_gt "$XRAY_REALITY_MLKEM_MIN_VERSION" "${version%%-*}"; then
         printf '%s\n' true
     fi
 }
 
-# 核心升降级后刷新 vless / vless-xhttp 的 .join，确保 support-x25519mlkem768 与当前核心一致
+# 核心升降级后刷新 vless / vless-xhttp 的 .join（支持多端口数组），确保 support-x25519mlkem768 与当前核心一致
 _refresh_xray_reality_joins() {
-    local cfg port uuid pubkey sid sni path security_mode
+    local raw cfg port uuid pubkey sid sni path security_mode
     if db_exists "xray" "vless"; then
-        cfg=$(db_get "xray" "vless" | jq -c 'if type == "array" then .[0] else . end' 2>/dev/null)
-        security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
-        if [[ "$security_mode" == "reality" ]]; then
+        raw=$(db_get "xray" "vless" 2>/dev/null)
+        while IFS= read -r cfg; do
+            [[ -z "$cfg" ]] && continue
+            security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
+            [[ "$security_mode" == "reality" ]] || continue
             port=$(echo "$cfg" | jq -r '.port // empty')
             uuid=$(echo "$cfg" | jq -r '.uuid // empty')
             pubkey=$(echo "$cfg" | jq -r '.public_key // empty')
@@ -8319,20 +8177,23 @@ _refresh_xray_reality_joins() {
                 _save_join_info "vless" "REALITY|%s|$port|$uuid|$pubkey|$sid|$sni" \
                     gen_vless_link "%s" "$port" "$uuid" "$pubkey" "$sid" "$sni"
             fi
-        fi
+        done < <(echo "$raw" | jq -c 'if type == "array" then .[] else . end' 2>/dev/null)
     fi
     if db_exists "xray" "vless-xhttp"; then
-        cfg=$(db_get "xray" "vless-xhttp" | jq -c 'if type == "array" then .[0] else . end' 2>/dev/null)
-        port=$(echo "$cfg" | jq -r '.port // empty')
-        uuid=$(echo "$cfg" | jq -r '.uuid // empty')
-        pubkey=$(echo "$cfg" | jq -r '.public_key // empty')
-        sid=$(echo "$cfg" | jq -r '.short_id // empty')
-        sni=$(echo "$cfg" | jq -r '.sni // empty')
-        path=$(echo "$cfg" | jq -r '.path // empty')
-        if [[ -n "$port" && -n "$uuid" && -n "$pubkey" ]]; then
-            _save_join_info "vless-xhttp" "REALITY-XHTTP|%s|$port|$uuid|$pubkey|$sid|$sni|$path" \
-                gen_vless_xhttp_link "%s" "$port" "$uuid" "$pubkey" "$sid" "$sni" "$path"
-        fi
+        raw=$(db_get "xray" "vless-xhttp" 2>/dev/null)
+        while IFS= read -r cfg; do
+            [[ -z "$cfg" ]] && continue
+            port=$(echo "$cfg" | jq -r '.port // empty')
+            uuid=$(echo "$cfg" | jq -r '.uuid // empty')
+            pubkey=$(echo "$cfg" | jq -r '.public_key // empty')
+            sid=$(echo "$cfg" | jq -r '.short_id // empty')
+            sni=$(echo "$cfg" | jq -r '.sni // empty')
+            path=$(echo "$cfg" | jq -r '.path // empty')
+            if [[ -n "$port" && -n "$uuid" && -n "$pubkey" ]]; then
+                _save_join_info "vless-xhttp" "REALITY-XHTTP|%s|$port|$uuid|$pubkey|$sid|$sni|$path" \
+                    gen_vless_xhttp_link "%s" "$port" "$uuid" "$pubkey" "$sid" "$sni" "$path"
+            fi
+        done < <(echo "$raw" | jq -c 'if type == "array" then .[] else . end' 2>/dev/null)
     fi
 }
 
@@ -8761,11 +8622,6 @@ _update_core_to_version() {
             _ok "服务已启动"
         fi
 
-        # Xray 核心升降级后刷新 Reality .join 链接（同步 support-x25519mlkem768）
-        if [[ "$core" == "Xray" ]]; then
-            _refresh_xray_reality_joins 2>/dev/null || true
-        fi
-
         # 展示变更日志
         case "$core" in
             Xray) _show_changelog_summary "XTLS/Xray-core" "$version" 8 ;;
@@ -9167,10 +9023,6 @@ _update_xray_transaction() (
             return 1
         fi
     done
-    if [[ -f "$CFG/sub.info" ]] && ! generate_sub_files; then
-        _err "订阅发布失败，将恢复之前的 Xray 版本"
-        return 1
-    fi
     committed=true
 )
 
@@ -9196,6 +9048,8 @@ update_xray_core() {
     fi
     new_version=$(_xray_binary_version "$XRAY_BINARY")
     _ok "Xray v$new_version 已安装"
+    # 核心升降级后刷新 Reality .join 链接（同步 support-x25519mlkem768）
+    _refresh_xray_reality_joins 2>/dev/null || true
     if [[ -n "$previous_version" && "$previous_version" != "$new_version" ]]; then
         _show_changelog_summary "XTLS/Xray-core" "$new_version" 10
     fi
@@ -9556,42 +9410,54 @@ regex = set()
 
 
 def fetch(name: str) -> str:
-    with urllib.request.urlopen(base.format(name), timeout=30) as resp:
-        return resp.read().decode('utf-8', 'ignore')
+    url = base.format(name)
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return resp.read().decode('utf-8', 'ignore')
+    except Exception as e:
+        print(f"拉取规则文件失败 ({url}): {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def parse_entry(raw_line: str):
     line = raw_line.strip()
     if not line or line.startswith('#'):
-        return None, set()
+        return None, []
     if '#' in line:
         line = line.split('#', 1)[0].strip()
     if not line:
-        return None, set()
+        return None, []
     parts = line.split()
     main = parts[0].strip()
-    attrs = set()
+    attrs = []
     if '@' in main:
         main, inline_attr = main.split('@', 1)
         main = main.strip()
         if inline_attr.strip():
-            attrs.add(inline_attr.strip().lower())
+            attrs.append(inline_attr.strip().lower())
     for extra in parts[1:]:
         if extra.startswith('@') and len(extra) > 1:
-            attrs.add(extra[1:].strip().lower())
+            val = extra[1:].strip().lower()
+            if val not in attrs:
+                attrs.append(val)
     return main, attrs
 
 
-def match_attr_filter(entry_attrs: set, required_attr: str) -> bool:
-    if not required_attr:
-        return True
-    if required_attr.startswith('!'):
-        return required_attr[1:] not in entry_attrs
-    return required_attr in entry_attrs
+def match_attr_filter(entry_attrs: list, required_attrs: tuple) -> bool:
+    for req in required_attrs:
+        if not req:
+            continue
+        if req.startswith('!'):
+            if req[1:] in entry_attrs:
+                return False
+        else:
+            if req not in entry_attrs:
+                return False
+    return True
 
 
-def load(name: str, required_attr: str = ''):
-    key = (name, required_attr)
+def load(name: str, required_attrs: tuple = ()):
+    key = (name, required_attrs)
     if not name or key in seen:
         return
     seen.add(key)
@@ -9602,13 +9468,10 @@ def load(name: str, required_attr: str = ''):
             continue
         if main.startswith('include:'):
             inc_target = main.split(':', 1)[1].strip()
-            inc_attr = required_attr
-            if attrs:
-                # 若 include 行自身携带 @attr，优先按该属性过滤
-                inc_attr = next(iter(attrs))
-            load(inc_target, inc_attr)
+            inc_attrs = tuple(attrs) if attrs else required_attrs
+            load(inc_target, inc_attrs)
             continue
-        if not match_attr_filter(attrs, required_attr):
+        if not match_attr_filter(attrs, required_attrs):
             continue
         if main.startswith('full:'):
             v = main.split(':', 1)[1].strip()
@@ -10296,7 +10159,8 @@ generate_singbox_config() {
                 }')
                 ;;
             anytls)
-                ensure_singbox_anytls_version false || return 1
+                # 版本不足时打印错误并仅跳过 anytls，避免连累同机共存的 hy2/tuic（仅装 anytls 时会因 success_count=0 报错）
+                ensure_singbox_anytls_version false || continue
                 local password=$(echo "$cfg" | jq -r '.password // empty')
                 local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
                 local cert_mode=$(echo "$cfg" | jq -r '.cert_mode // ""')
@@ -11180,6 +11044,14 @@ gen_tuic_server_config() {
 gen_anytls_server_config() {
     local password="$1" port="$2" sni="${3:-www.bing.com}" cert_mode="${4:-}" padding_scheme_json="${5:-}"
     mkdir -p "$CFG"
+
+    # 兼容清理旧版独立 anytls-server 服务与二进制残留
+    if [[ -f /etc/systemd/system/vless-anytls.service || -f /etc/init.d/vless-anytls || -f /usr/local/bin/anytls-server ]]; then
+        svc stop vless-anytls 2>/dev/null || true
+        svc disable vless-anytls 2>/dev/null || true
+        rm -f /etc/systemd/system/vless-anytls.service /etc/init.d/vless-anytls /usr/local/bin/anytls-server 2>/dev/null || true
+        command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+    fi
 
     # 智能判定证书模式：实时检测磁盘上的 ACME 真证书是否有效
     if [[ -z "$cert_mode" ]]; then
@@ -13898,34 +13770,6 @@ db_clear_routing_rules() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 负载均衡组管理
 #═══════════════════════════════════════════════════════════════════════════════
-
-# 数据库：添加负载均衡组
-# 用法: db_add_balancer_group "组名" "策略" "节点1" "节点2" ...
-# 策略: random(随机), roundRobin(轮询), leastPing(最低延迟), leastLoad(最低负载)
-# 注意: leastPing/leastLoad需要Observatory配置,配置生成时会自动添加burstObservatory
-db_add_balancer_group() {
-    local name="$1" strategy="$2"
-    shift 2
-    local nodes=("$@")
-
-    [[ ! -f "$DB_FILE" ]] && echo '{}' > "$DB_FILE"
-
-    # 构建节点数组
-    local nodes_json=$(printf '%s\n' "${nodes[@]}" | jq -R . | jq -s .)
-
-    # 构建组对象
-    local group_json=$(jq -n \
-        --arg name "$name" \
-        --arg strategy "$strategy" \
-        --argjson nodes "$nodes_json" \
-        '{name: $name, strategy: $strategy, nodes: $nodes}')
-
-    # 写入数据库
-    local tmp=$(mktemp)
-    jq --argjson group "$group_json" \
-        '.balancer_groups = (.balancer_groups // []) + [$group]' \
-        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
-}
 
 # 数据库：获取所有负载均衡组
 db_get_balancer_groups() {
@@ -19179,42 +19023,8 @@ show_single_protocol_info() {
         fi
     fi
     
-    # 显示订阅链接提示
-    if [[ "$has_cert_protocol" == "true" ]]; then
-        # 有证书协议，显示订阅状态
-        if [[ "$web_service_running" == "true" && -f "$CFG/sub.info" ]]; then
-            source "$CFG/sub.info"
-            local sub_protocol="http"
-            [[ "$sub_https" == "true" ]] && sub_protocol="https"
-            local base_url="${sub_protocol}://${sub_domain:-$ipv4}:${sub_port}/sub/${sub_uuid}"
-            echo -e "  ${Y}Clash/Clash Verge:${NC}"
-            echo -e "  ${G}$base_url/clash${NC}"
-        elif [[ "$web_service_running" == "true" ]]; then
-            echo -e "  ${Y}订阅服务未配置，请在主菜单选择「订阅管理」进行配置${NC}"
-        else
-            echo -e "  ${D}(Web服务未运行，订阅功能不可用)${NC}"
-            echo -e "  ${D}提示: 请在主菜单选择「订阅管理」配置订阅服务${NC}"
-        fi
-    elif [[ "$has_reality" == "true" && ("$protocol" == "vless" || "$protocol" == "vless-xhttp") ]]; then
-        # Reality 协议：订阅需要手动配置真实域名和启用
-        if [[ -n "$domain" && -f "$CFG/sub.info" && "$web_service_running" == "true" ]]; then
-            source "$CFG/sub.info"
-            
-            # Reality 真实域名模式时，检查订阅是否已手动启用
-            if [[ "${sub_enabled:-false}" == "true" && -n "$sub_port" ]]; then
-                local base_url="https://${sub_domain:-$domain}:${sub_port}/sub/${sub_uuid}"
-                echo -e "  ${Y}Clash/Clash Verge:${NC}"
-                echo -e "  ${G}$base_url/clash${NC}"
-            else
-                echo -e "  ${D}(订阅服务未启用，如需使用请在主菜单选择「订阅管理」)${NC}"
-            fi
-        else
-            echo -e "  ${D}(直接使用分享链接即可)${NC}"
-        fi
-    else
-        # Sing-box 协议 (hy2/tuic) 或其他协议
-        echo -e "  ${D}(直接使用分享链接即可)${NC}"
-    fi
+    # 直接使用上方单节点分享链接导入客户端
+    echo -e "  ${D}(直接使用分享链接即可)${NC}"
     
     _line
     [[ "$clear_screen" == "true" ]] && _pause
