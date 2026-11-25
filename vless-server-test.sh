@@ -30,7 +30,7 @@ fi
 
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.6.3 [服务端]
+#  多协议代理一键部署脚本 v3.6.4 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -48,7 +48,7 @@ fi
 #  项目地址: https://github.com/jet3918/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.6.3"
+readonly VERSION="3.6.4"
 readonly AUTHOR="jet3918"
 readonly REPO_URL="https://github.com/jet3918/vless-all-in-one"
 readonly SCRIPT_REPO="jet3918/vless-all-in-one"
